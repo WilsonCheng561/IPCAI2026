@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.ipynb_checkpoints/
+.env
+.venv
+venv/
+*.log
+
+# Build / cache
+dist/
+build/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (如需版本控制可改用 LFS)
+datasets/
+data/
+outputs/
+results/
+runs/
+
+# Big archives（建议走 LFS）
+*.tar
+*.tar.gz
+*.zip
+*.7z
+*.rar
