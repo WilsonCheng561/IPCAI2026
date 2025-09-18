@@ -1,0 +1,86 @@
+seed_everything: 42
+
+model:
+  class_path: no_time_to_train.pl_wrapper.sam2matcher_pl.Sam2MatcherLightningModel
+  init_args:
+    # ─────────────── 模型与权重 ───────────────
+    model_cfg:
+      name: "matching_baseline_noAMG"
+
+      sam2_cfg_file: "sam2_hiera_l.yaml"
+      sam2_ckpt_path: "./checkpoints/sam2_hiera_large.pt"
+
+      sam2_infer_cfgs:
+        points_per_side: 16         # CHANGED: 32 -> 16（更省显存；必要时可改 8）
+        testing_point_bs: 32         # CHANGED: 256 -> 64
+        iou_thr: 0.4
+        nms_thr: 0.5
+        num_out_instance: 30         # CHANGED: 100 -> 50
+        kmeans_k: 4
+        n_pca_components: 2
+        cls_num_per_mask: 1
+
+      encoder_cfg:
+        name: "dinov2_large"
+        img_size: 896
+        patch_size: 14
+      encoder_ckpt_path: "./checkpoints/dinov2/dinov2_vitl14_pretrain.pth"
+
+      # ─────────────── Memory-bank 关键参数 ───────────────
+      memory_bank_cfg:
+        enable: True
+        category_num: 10
+        length: 5                    # 保持与当前 K 一致；run.sh 会用 CLI 覆盖
+
+      dataset_name: cholec80
+
+    # ─────────────── 数据集路径 ───────────────
+    dataset_cfgs:
+      fill_memory:
+        name: "cholec80"
+        root: "/mnt/disk0/haoding/no-time-to-train/data/images"
+        json_file: "/mnt/disk0/haoding/no-time-to-train/data/annotations/custom_references_with_SAM_segm.json"  # CHANGED: 用参考集（含 segm）
+        memory_pkl: "/mnt/disk0/haoding/no-time-to-train/data/annotations/custom_references_with_SAM_segm.pkl"
+        image_size: 768
+        memory_length: 5
+        context_ratio: 0.2
+        norm_img: False
+        cat_names: &CLASSES
+          - Gallbladder
+          - Left Grasper
+          - TOP Grasper
+          - Right Grasper
+          - Bipolar
+          - Hook
+          - Scissors
+          - Clipper
+          - Irrigator
+          - SpecimenBag
+
+      test:
+        name: "cholec80"
+        root: "/mnt/disk0/haoding/no-time-to-train/data/images"
+        json_file: "/mnt/disk0/haoding/no-time-to-train/data/annotations/custom_targets_with_SAM_segm.json"      # CHANGED: 用目标集（含 segm）才能评 mAP
+        image_size: 768              # CHANGED: 1024 -> 768（必要时再降到 640）
+        norm_img: False
+        with_query_points: False
+        cat_names: *CLASSES
+
+    # ─────────────── DataLoader 线程数 ───────────────
+    data_load_cfgs:
+      workers: 4
+
+# ─────────────── PL Trainer 设置 ───────────────
+trainer:
+  devices: 1
+  benchmark: true
+  precision: 16                    # CHANGED: 32 -> 16（半精度省显存）
+  callbacks:
+    - class_path: pytorch_lightning.callbacks.TQDMProgressBar
+      init_args:
+        refresh_rate: 10
+  logger:
+    - class_path: pytorch_lightning.loggers.CSVLogger
+      init_args:
+        flush_logs_every_n_steps: 50
+        save_dir: ./work_dirs/cholec80_5shot

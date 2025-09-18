@@ -1,0 +1,30 @@
+model:
+  init_args:
+    model_cfg:
+      sam2_cfg_file: "sam2_hiera_l.yaml"   # ← 继续用 1024 的 SAM2 配置
+
+      sam2_infer_cfgs:
+        points_per_side: 8         # ← 降低显存占用（原来 32）
+        testing_point_bs: 8        # ← 强烈建议先用 8 或 16
+        num_out_instance: 10       # ← 先小一点，跑通再加
+        iou_thr: 0.4
+        nms_thr: 0.5
+        kmeans_k: 3
+        n_pca_components: 2
+        cls_num_per_mask: 1
+
+      encoder_cfg:
+        name: "dinov2_large"
+        img_size: 896              # ← 关键：64*14 对齐 SAM 的 64 网格
+        patch_size: 14
+
+    dataset_cfgs:
+      fill_memory:
+        image_size: 1024           # ← 与 SAM 一致
+      test:
+        image_size: 1024           # ← 与 SAM 一致
+
+trainer:
+  precision: 16                    # ← 半精度更省显存
+data_load_cfgs:
+  workers: 0                       # ← 先用 0，稳定为主

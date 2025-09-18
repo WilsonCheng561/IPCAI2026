@@ -1,0 +1,87 @@
+seed_everything: 42
+
+model:
+  class_path: no_time_to_train.pl_wrapper.sam2matcher_pl.Sam2MatcherLightningModel
+  init_args:
+    # ─────────────── 模型与权重 ───────────────
+    model_cfg:
+      name: "matching_baseline_noAMG"
+
+      sam2_cfg_file: "sam2_hiera_l.yaml"
+      sam2_ckpt_path: "./checkpoints/sam2_hiera_large.pt"
+
+      sam2_infer_cfgs:
+        points_per_side: 32
+        testing_point_bs: 256
+        iou_thr: 0.4
+        nms_thr: 0.5
+        num_out_instance: 100
+        kmeans_k: 4
+        n_pca_components: 3
+        cls_num_per_mask: 1
+
+      encoder_cfg:
+        name: "dinov2_large"
+        img_size: 518
+        patch_size: 14
+      encoder_ckpt_path: "./checkpoints/dinov2/dinov2_vitl14_pretrain.pth"
+
+      # ─────────────── Memory-bank 关键参数 ───────────────
+      memory_bank_cfg:
+        enable: True
+        category_num: 10        # ← Cholec80 共 10 类
+        length: 5              # ← 5-shot                                                     #################################################更改k这里也要改
+
+      # （可选）给数据集打上标签，方便日志
+      dataset_name: cholec80
+
+    # ─────────────── 数据集路径 ───────────────
+    dataset_cfgs:
+      fill_memory:
+        name: "cholec80"
+        root: "/mnt/disk0/haoding/no-time-to-train/data/images"
+        json_file: "/mnt/disk0/haoding/no-time-to-train/data/annotations/custom_targets_with_SAM_segm.json"
+        memory_pkl: "/mnt/disk0/haoding/no-time-to-train/data/annotations/custom_references_with_SAM_segm.pkl"
+        image_size: 518
+        memory_length: 5        # ← 与 length 保持一致
+        context_ratio: 0.2
+        norm_img: False
+        cat_names: &CLASSES
+          - Gallbladder
+          - Left Grasper
+          - TOP Grasper
+          - Right Grasper
+          - Bipolar
+          - Hook
+          - Scissors
+          - Clipper
+          - Irrigator
+          - SpecimenBag
+
+      test:
+        name: "cholec80"
+        root: "/mnt/disk0/haoding/no-time-to-train/data/images"
+        json_file: "/mnt/disk0/haoding/no-time-to-train/data/annotations/custom_targets.json"
+        image_size: 1024
+        norm_img: False
+        with_query_points: False
+        cat_names: *CLASSES         # ← 复用同一顺序
+
+    # ─────────────── DataLoader 线程数 ───────────────
+    data_load_cfgs:
+      workers: 4
+
+# ─────────────── PL Trainer 设置 ───────────────
+trainer:
+  devices: 1           # 只用 1 张 GPU 跑 fill-memory；显存不足可设 "cpu"
+  benchmark: true
+  precision: 32
+  callbacks:
+    - class_path: pytorch_lightning.callbacks.TQDMProgressBar
+      init_args:
+        refresh_rate: 10
+  logger:
+    - class_path: pytorch_lightning.loggers.CSVLogger
+      init_args:
+        flush_logs_every_n_steps: 50
+        save_dir: ./work_dirs/cholec80_5shot                                            #################################################更改k这里也要改

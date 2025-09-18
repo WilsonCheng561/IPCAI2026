@@ -86,9 +86,13 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor) -> Tensor:
-        def attn_residual_func(x: Tensor) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x)))
+    def forward(self, x: Tensor, ret_attn=False):
+        def attn_residual_func(x: Tensor, ret_attn=False):
+            if not ret_attn:
+                return self.ls1(self.attn(self.norm1(x)))
+            else:
+                _x, attn = self.attn(self.norm1(x), ret_attn=True)
+                return self.ls1(_x), attn
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))
@@ -109,8 +113,14 @@ class Block(nn.Module):
             x = x + self.drop_path1(attn_residual_func(x))
             x = x + self.drop_path1(ffn_residual_func(x))  # FIXME: drop_path2
         else:
-            x = x + attn_residual_func(x)
-            x = x + ffn_residual_func(x)
+            if not ret_attn:
+                x = x + attn_residual_func(x)
+                x = x + ffn_residual_func(x)
+            else:
+                _x, attn = attn_residual_func(x, ret_attn=True)
+                x = x + _x
+                x = x + ffn_residual_func(x)
+                return x, attn
         return x
 
 
@@ -249,10 +259,11 @@ class NestedTensorBlock(Block):
             x = x + ffn_residual_func(x)
             return attn_bias.split(x)
 
-    def forward(self, x_or_x_list):
+    def forward(self, x_or_x_list, ret_attn=False):
         if isinstance(x_or_x_list, Tensor):
-            return super().forward(x_or_x_list)
+            return super().forward(x_or_x_list, ret_attn=ret_attn)
         elif isinstance(x_or_x_list, list):
+            assert not ret_attn
             if not XFORMERS_AVAILABLE:
                 raise AssertionError("xFormers is required for using nested tensors")
             return self.forward_nested(x_or_x_list)
