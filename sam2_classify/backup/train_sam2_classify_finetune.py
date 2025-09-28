@@ -2,15 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 End-to-end fine-tuning: update SAM2 + classification head with point prompts.
-- Balancing: sampler / CE class weights / focal (optional) / logit-adjust (optional)
-- Mixed precision (optional), grad clipping
-- Checkpoints: save BOTH sam2 & head with finetune-specific names
+- Imbalance: sampler OR CB-CE / LDAM-DRW (choose one, avoid double reweight)
+- Logit-adjust (optional), MixUp (optional)
+- AMP (bf16/FP16), grad clipping, gradient accumulation
+- Save best by macro-F1 (focus on tail classes)
+- Memory: limit input edge, channels_last, inference_mode for eval
 
-Author: Wenzheng Cheng
+Author: Wenzheng Cheng (+ minimal modifications)
 """
 
-import os, json, argparse, random, time, math, hashlib
-from collections import OrderedDict
+import os, json, argparse, random, time
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 
@@ -29,7 +30,7 @@ except ImportError:
         return x
 
 # ----------------------------- Global paths -----------------------------
-SMALLFILE_ROOT = Path("/home/wcheng31/sam2_classify")
+SMALLFILE_ROOT = Path("/home/wcheng31/sam2_classify/config")
 PRETRAIN_ROOT  = Path("/projects/surgical-video-digital-twin/pretrain_params")
 CKPT_ROOT      = PRETRAIN_ROOT / "cwz" / "sam2_classifier"
 DATASET_ROOT   = Path("/projects/surgical-video-digital-twin/datasets/sam2_classifier")
@@ -50,7 +51,7 @@ def _stable_train_val_test_split(df: pd.DataFrame, seed: int = 42,
                                  train_ratio: float = 0.8, val_ratio: float = 0.1):
     rng = np.random.RandomState(seed)
     train_parts, val_parts, test_parts = [], [], []
-    for clip, g in df.groupby("clip_name"):
+    for _, g in df.groupby("clip_name"):
         idx = g.index.to_numpy()
         rng.shuffle(idx)
         n = len(idx)
@@ -107,6 +108,31 @@ def _sampling_weights_from_counts(counts: np.ndarray, alpha: float = 0.5, bg_fac
     if len(w) > 0:
         w[0] *= float(bg_factor)   # assume 0 is background
     return w
+
+# ---- New: Class-Balanced weights (Effective Number) ----
+def _cb_weights_from_counts(counts: np.ndarray, beta: float = 0.9999) -> torch.Tensor:
+    counts = np.asarray(counts, dtype=np.float64)
+    eff_num = 1.0 - np.power(beta, np.maximum(counts, 1.0))
+    w = (1.0 - beta) / eff_num
+    w = w / (w.sum() / len(w))
+    return torch.tensor(w, dtype=torch.float32)
+
+# ---- New: LDAM loss (with optional DRW) ----
+class LDAMLoss(nn.Module):
+    def __init__(self, cls_num_list, max_m=0.5, s=30, reweight: Optional[torch.Tensor]=None):
+        super().__init__()
+        cls_num = np.array(cls_num_list, dtype=np.float64)
+        m_list = max_m / np.power(np.maximum(cls_num, 1.0), 0.25)
+        self.m_list = torch.tensor(m_list, dtype=torch.float32)
+        self.s = s
+        self.reweight = reweight
+    def forward(self, logits, target):
+        index = torch.zeros_like(logits, dtype=torch.bool)
+        index.scatter_(1, target.view(-1,1), 1)
+        margins = torch.zeros_like(logits)
+        margins[index] = self.m_list.to(logits.device)[target]
+        logits_m = self.s * (logits - margins)
+        return F.cross_entropy(logits_m, target, weight=self.reweight)
 
 # ----------------------------- Dataset -----------------------------
 class FramePointDataset(Dataset):
@@ -178,20 +204,21 @@ def collate_varlen(batch):
 class FineTuneSam2Wrapper(nn.Module):
     """
     Trainable wrapper. End-to-end gradients flow into SAM2 + head.
-    为 background 类新增 bg-mask 策略：
+    bg-mask 策略：
       - pos   : 将提供的“背景点”全部当作正点(=1)生掩码
       - global: 直接用全图掩码(=1)
       - mix   : 按概率混用两者（bg_mix_p 概率用 global）
     """
-    def __init__(self, cfg: str, ckpt: str, device: str = "cuda"):
+    def __init__(self, cfg: str, ckpt: str, device: str = "cuda", max_input_edge: int = 1536):
         super().__init__()
         self.device = device
+        self.max_input_edge = int(max_input_edge)
         from sam2.build_sam import build_sam2
         self.model = build_sam2(cfg, ckpt, device=device)
         self.verbose = False
         self._norm_cached: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
-    # 让哪些模块可训练
+    # 控制可训练模块
     def set_trainable(self, which: str = "all"):
         which = (which or "all").lower()
         for p in self.model.parameters():
@@ -249,6 +276,16 @@ class FineTuneSam2Wrapper(nn.Module):
         t_w = max(win, (t_w0 // win) * win)
         H_in = self._size_for_tokens(t_h, k_h, s_h, p_h)
         W_in = self._size_for_tokens(t_w, k_w, s_w, p_w)
+        # ---- New: cap by max_input_edge to save memory ----
+        if max(H_in, W_in) > self.max_input_edge:
+            scale = self.max_input_edge / max(H_in, W_in)
+            H_in = int(round(H_in * scale))
+            W_in = int(round(W_in * scale))
+            # 重新对齐到 token/grid
+            t_h = max(win, (self._tokens_for(H_in, k_h, s_h, p_h) // win) * win)
+            t_w = max(win, (self._tokens_for(W_in, k_w, s_w, p_w) // win) * win)
+            H_in = self._size_for_tokens(t_h, k_h, s_h, p_h)
+            W_in = self._size_for_tokens(t_w, k_w, s_w, p_w)
         sy = H_in / max(1, H0); sx = W_in / max(1, W0)
         return H_in, W_in, sy, sx
 
@@ -408,7 +445,6 @@ class FineTuneSam2Wrapper(nn.Module):
         pts[:, 0] *= sx; pts[:, 1] *= sy
         return torch.from_numpy(pts[:, :2]).unsqueeze(0).float()
 
-    # --------- 关键改动：支持 bg 掩码策略 ----------
     def _build_mask_for_sample(self,
                                img_feat: torch.Tensor,
                                img_pe: Optional[torch.Tensor],
@@ -421,7 +457,6 @@ class FineTuneSam2Wrapper(nn.Module):
         Hf, Wf = img_feat.shape[-2], img_feat.shape[-1]
         device = img_feat.device
 
-        # 没有点 → 兜底全图
         if pts_np is None or len(pts_np) == 0:
             return torch.ones((1,1,Hf,Wf), device=device)
 
@@ -432,13 +467,10 @@ class FineTuneSam2Wrapper(nn.Module):
         if is_bg and mode == "global":
             return torch.ones((1,1,Hf,Wf), device=device)
 
-        # 走点提示分支
         coords = self._map_points_scale_xy(pts_np, sy, sx).to(device)
         if is_bg and mode == "pos":
-            # 将传入的“背景点/接触点”全部当正点=1
             labels = torch.ones((1, coords.shape[1]), dtype=torch.long, device=device)
         else:
-            # 前景类：保留原始 0/1（正/负）标签
             raw = np.asarray(pts_np, np.float32)
             lab = raw[:, 2] if raw.shape[1] >= 3 else np.ones((raw.shape[0],), np.float32)
             labels = torch.from_numpy(lab).long().unsqueeze(0).to(device)
@@ -457,15 +489,13 @@ class FineTuneSam2Wrapper(nn.Module):
                 targets: Optional[torch.Tensor] = None,
                 bg_mask_mode: str = "pos",
                 bg_mix_p: float = 0.5) -> torch.Tensor:
-        """
-        targets: (B,) LongTensor，类别 id；用来判断是否为 background(=0)
-        """
         feats = []
         B = len(images_bgr)
         for i in range(B):
             img_bgr = images_bgr[i]
             pts_np  = points_list[i]
             img_t, _, _, sy, sx = self._preprocess_manual(img_bgr)
+            img_t = img_t.to(memory_format=torch.channels_last)
             img_feat, img_pe, high_res = self._get_image_embed(img_t)
 
             is_bg = False
@@ -479,15 +509,9 @@ class FineTuneSam2Wrapper(nn.Module):
 
             feat = (img_feat * mask).flatten(2).sum(dim=-1) / (mask.flatten(2).sum(dim=-1) + 1e-6)
             feats.append(feat.squeeze(0))
+            # 及时释放局部中间变量引用（Python 级）
+            del img_t, img_feat, img_pe, high_res, mask
         return torch.stack(feats, dim=0)
-
-    @staticmethod
-    def _map_points_scale_xy(points: np.ndarray, sy: float, sx: float) -> torch.Tensor:
-        if points is None or len(points) == 0:
-            return torch.zeros((1,0,2), dtype=torch.float32)
-        pts = np.asarray(points, dtype=np.float32).copy()
-        pts[:, 0] *= sx; pts[:, 1] *= sy
-        return torch.from_numpy(pts[:, :2]).unsqueeze(0).float()
 
 # ----------------------------- Heads -----------------------------
 class MLPHead(nn.Module):
@@ -548,41 +572,72 @@ def train_one_epoch(extractor: nn.Module,
                     log_prior: Optional[torch.Tensor] = None,
                     logit_adjust_tau: float = 0.0,
                     amp: bool = True,
+                    amp_dtype: torch.dtype = torch.float16,
                     bg_mask_mode: str = "mix",
-                    bg_mix_p: float = 0.5):
+                    bg_mix_p: float = 0.5,
+                    accum_steps: int = 1,
+                    do_mixup: bool = False,
+                    mixup_alpha: float = 0.2):
     extractor.train(); head.train()
     running_loss, n = 0.0, 0
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
     pbar = tqdm(loader, total=len(loader), ncols=100, desc=f"Epoch {epoch} [train]", leave=False)
+    optimizer.zero_grad(set_to_none=True)
     for step, batch in enumerate(pbar, 1):
         imgs, pts, metas = batch["images"], batch["points"], batch["meta"]
-        y = batch["targets"].to(device)
+        y = batch["targets"].to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=amp):
+        with torch.cuda.amp.autocast(enabled=amp, dtype=amp_dtype):
             feats = extractor(imgs, pts, metas, targets=y,
                               bg_mask_mode=bg_mask_mode, bg_mix_p=bg_mix_p)
-            logits = head(feats)
-            logits = _apply_logit_adjust(logits, log_prior, logit_adjust_tau)
-            loss = loss_fn(logits, y)
+            if do_mixup and feats.size(0) > 1:
+                lam = np.random.beta(mixup_alpha, mixup_alpha)
+                perm = torch.randperm(feats.size(0), device=feats.device)
+                feats = lam * feats + (1 - lam) * feats[perm]
+                logits = head(feats)
+                logits = _apply_logit_adjust(logits, log_prior, logit_adjust_tau)
+                loss = lam * loss_fn(logits, y) + (1 - lam) * loss_fn(logits, y[perm])
+            else:
+                logits = head(feats)
+                logits = _apply_logit_adjust(logits, log_prior, logit_adjust_tau)
+                loss = loss_fn(logits, y)
 
+        loss = loss / max(1, accum_steps)
         scaler.scale(loss).backward()
-        if max_grad_norm and max_grad_norm > 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(list(extractor.parameters()) + list(head.parameters()), max_grad_norm)
-        scaler.step(optimizer)
-        scaler.update()
+
+        if step % accum_steps == 0:
+            if max_grad_norm and max_grad_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(list(extractor.parameters()) + list(head.parameters()), max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         bs = y.size(0)
-        running_loss += loss.item() * bs
+        running_loss += loss.item() * bs * max(1, accum_steps)  # 还原
         n += bs
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
-        logger.write(f"epoch={epoch} step={step}/{len(loader)} train_loss={loss.item():.6f}")
+        pbar.set_postfix(loss=f"{(running_loss/max(1,n)):.4f}")
+        logger.write(f"epoch={epoch} step={step}/{len(loader)} train_loss={(running_loss/max(1,n)):.6f}")
     return running_loss / max(1, n)
 
-
 @torch.no_grad()
+def _compute_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, n_classes: int):
+    conf = torch.zeros((n_classes, n_classes), dtype=torch.long, device=y_true.device)
+    for t, p in zip(y_true, y_pred):
+        conf[t, p] += 1
+    eps = 1e-12
+    tp = conf.diag().float()
+    pp = conf.sum(dim=0).float()
+    tp_fn = conf.sum(dim=1).float()
+    prec = tp / (pp + eps)
+    rec  = tp / (tp_fn + eps)
+    f1   = 2 * prec * rec / (prec + rec + eps)
+    macro_f1 = torch.nanmean(f1).item()
+    bal_acc  = torch.nanmean(rec).item()
+    return {"macro_f1": macro_f1, "balanced_acc": bal_acc, "confusion": conf.cpu()}
+
+@torch.inference_mode()
 def evaluate(extractor: nn.Module,
              head: nn.Module,
              loader: DataLoader,
@@ -596,20 +651,20 @@ def evaluate(extractor: nn.Module,
              log_prior: Optional[torch.Tensor] = None,
              logit_adjust_tau: float = 0.0,
              amp: bool = True,
+             amp_dtype: torch.dtype = torch.float16,
              bg_mask_mode: str = "mix",
              bg_mix_p: float = 0.5):
     extractor.eval(); head.eval()
     total_loss, n = 0.0, 0
     correct = 0
-    if n_classes is not None:
-        per_cls_total = torch.zeros(n_classes, dtype=torch.long)
-        per_cls_correct = torch.zeros(n_classes, dtype=torch.long)
+    y_true_all, y_pred_all = [], []
 
     pbar = tqdm(loader, total=len(loader), ncols=100, desc=f"Epoch {epoch} [{split_name}]", leave=False)
     for batch in pbar:
         imgs, pts, metas = batch["images"], batch["points"], batch["meta"]
-        y = batch["targets"].to(device)
-        with torch.cuda.amp.autocast(enabled=amp):
+        y = batch["targets"].to(device, non_blocking=True)
+
+        with torch.cuda.amp.autocast(enabled=amp, dtype=amp_dtype):
             feats = extractor(imgs, pts, metas, targets=y,
                               bg_mask_mode=bg_mask_mode, bg_mix_p=bg_mix_p)
             logits = head(feats)
@@ -621,31 +676,35 @@ def evaluate(extractor: nn.Module,
         n += bs
         preds = logits.argmax(dim=1)
         correct += (preds == y).sum().item()
-
-        if n_classes is not None:
-            for c in range(n_classes):
-                mask = (y == c)
-                if mask.any():
-                    per_cls_total[c] += int(mask.sum().item())
-                    per_cls_correct[c] += int((preds[mask] == c).sum().item())
-
+        y_true_all.extend(y.tolist()); y_pred_all.extend(preds.tolist())
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
     avg_loss = total_loss / max(1, n)
     acc = correct / max(1, n)
     logger.write(f"epoch={epoch} {split_name}_loss={avg_loss:.6f} {split_name}_acc={acc:.6f}")
 
-    if n_classes is not None and id2name is not None:
-        print(f"[{split_name.upper()} per-class acc] (epoch {epoch})")
-        for c in range(n_classes):
-            n_c = int(per_cls_total[c].item())
-            acc_c = (per_cls_correct[c].item() / n_c) if n_c > 0 else float('nan')
-            name = id2name.get(c, f"class{c}")
-            print(f"  {c:2d} {name:>16s}: acc={acc_c:.4f}  (n={n_c})")
-            logger.write(f"epoch={epoch} {split_name}_clsacc[{c}][{name}]={acc_c:.6f} n={n_c}")
+    metrics = {}
+    if (n_classes is not None) and (len(y_true_all) > 0):
+        yt = torch.tensor(y_true_all, device=device)
+        yp = torch.tensor(y_pred_all, device=device)
+        metrics = _compute_metrics(yt, yp, n_classes)
+        macro_f1 = metrics["macro_f1"]; bal_acc = metrics["balanced_acc"]
+        print(f"[{split_name.upper()} extra] macroF1={macro_f1:.4f}  balAcc={bal_acc:.4f}")
+        logger.write(f"epoch={epoch} {split_name}_macroF1={macro_f1:.6f} {split_name}_balAcc={bal_acc:.6f}")
 
-    return avg_loss, acc
+        if id2name is not None:
+            conf = metrics["confusion"].numpy()
+            per_cls_total = conf.sum(axis=1)
+            per_cls_correct = np.diag(conf)
+            print(f"[{split_name.upper()} per-class acc] (epoch {epoch})")
+            for c in range(n_classes):
+                n_c = int(per_cls_total[c])
+                acc_c = (per_cls_correct[c] / n_c) if n_c > 0 else float('nan')
+                name = id2name.get(c, f"class{c}")
+                print(f"  {c:2d} {name:>16s}: acc={acc_c:.4f}  (n={n_c})")
+                logger.write(f"epoch={epoch} {split_name}_clsacc[{c}][{name}]={acc_c:.6f} n={n_c}")
 
+    return avg_loss, acc, metrics
 
 # ----------------------------- Main -----------------------------
 def _parse_hidden_list(s: str) -> List[int]:
@@ -665,37 +724,46 @@ def main():
     ap.add_argument("--sam2-ckpt", type=str, default=str(PRETRAIN_ROOT / "sam2_hiera_large.pt"))
 
     # training setup
-    ap.add_argument("--epochs", type=int, default=20)
-    ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--accum-steps", type=int, default=1, help="gradient accumulation steps")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=123)
-    ap.add_argument("--patience", type=int, default=5)
+    ap.add_argument("--patience", type=int, default=6)
     ap.add_argument("--resize", type=int, default=None)
     ap.add_argument("--out-dir", type=str, default=str(CKPT_ROOT))
     ap.add_argument("--amp", action="store_true")
+    ap.add_argument("--max-input-edge", type=int, default=1536, help="cap SAM2 input long edge to save memory")
 
     # model/head
-    ap.add_argument("--head", choices=["linear","mlp","mlp_bn","cosine"], default="mlp")
+    ap.add_argument("--head", choices=["linear","mlp","mlp_bn","cosine"], default="cosine")
     ap.add_argument("--hidden", type=str, default="0")
     ap.add_argument("--drop", type=float, default=0.0)
     ap.add_argument("--scale", type=float, default=16.0, help="scale for cosine head")
 
     # LR / WD (differential)
-    ap.add_argument("--lr-backbone", type=float, default=5e-5)
-    ap.add_argument("--lr-head", type=float, default=1e-3)
+    ap.add_argument("--lr-backbone", type=float, default=1e-5)
+    ap.add_argument("--lr-head", type=float, default=2e-3)
     ap.add_argument("--wd-backbone", type=float, default=0.05)
     ap.add_argument("--wd-head", type=float, default=0.05)
     ap.add_argument("--sched", choices=["none","cosine"], default="cosine")
-    ap.add_argument("--warmup-epochs", type=int, default=0)
-    ap.add_argument("--max-grad-norm", type=float, default=0.0)
+    ap.add_argument("--warmup-epochs", type=int, default=3)
+    ap.add_argument("--max-grad-norm", type=float, default=1.0)
 
-    # balancing / focal / logit-adjust
-    ap.add_argument("--balance", choices=["none","weights","sampler","auto"], default="auto")
-    ap.add_argument("--focal", action="store_true")
-    ap.add_argument("--reweight-alpha", type=float, default=0.5)
-    ap.add_argument("--bg-factor", type=float, default=0.3)
+    # imbalance / loss / logit-adjust
+    ap.add_argument("--balance", choices=["none","weights","sampler","auto"], default="sampler")
+    ap.add_argument("--reweight-alpha", type=float, default=0.3)
+    ap.add_argument("--bg-factor", type=float, default=0.5)
     ap.add_argument("--smoothing", type=float, default=0.0)
-    ap.add_argument("--logit-adjust", type=float, default=0.0)
+    ap.add_argument("--logit-adjust", type=float, default=0.5)
+
+    # New: loss family
+    ap.add_argument("--loss", choices=["ce","cb","ldam","focal"], default="cb",
+                    help="cb=Class-Balanced CE; ldam=LDAM-DRW; focal=Focal; ce=plain CE")
+    ap.add_argument("--cb-beta", type=float, default=0.9999)
+    ap.add_argument("--drw-epoch", type=int, default=0, help="start epoch for DRW (ldam); 0=off")
+    ap.add_argument("--mixup", action="store_true")
+    ap.add_argument("--mixup-alpha", type=float, default=0.2)
 
     # finetune which modules
     ap.add_argument("--trainable", type=str, default="all",
@@ -708,14 +776,17 @@ def main():
 
     ap.add_argument("--bg-mask-mode", choices=["pos","global","mix"], default="mix",
                 help="background 类的掩码策略：pos=把bg点当正点；global=全图；mix=两者随机混用")
-    ap.add_argument("--bg-mix-p", type=float, default=0.5,  
+    ap.add_argument("--bg-mix-p", type=float, default=0.5,
                 help="当 bg-mask-mode=mix 时，采用 global 的概率")
 
-
     args = ap.parse_args()
-    if args.resize is not None:
-        print("[WARN] You set --resize. Prefer --resize=None so the wrapper handles sizing.")
     set_seed(args.seed)
+
+    # perf/precision knobs
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    amp_dtype = torch.bfloat16 if (device=="cuda" and torch.cuda.is_bf16_supported()) else torch.float16
 
     data_root = Path(args.data_root)
     manifest_path = Path(args.manifest) if args.manifest else (data_root / "manifest.csv")
@@ -771,17 +842,19 @@ def main():
 
     dl_train = DataLoader(ds_train, batch_size=args.batch_size,
                           shuffle=(sampler is None), sampler=sampler,
-                          num_workers=args.workers, collate_fn=collate_varlen, pin_memory=True)
+                          num_workers=args.workers, collate_fn=collate_varlen, pin_memory=True,
+                          persistent_workers=(args.workers>0), prefetch_factor=2)
     dl_val   = DataLoader(ds_val,   batch_size=args.batch_size, shuffle=False, num_workers=args.workers,
-                          collate_fn=collate_varlen, pin_memory=True) if ds_val else None
+                          collate_fn=collate_varlen, pin_memory=True,
+                          persistent_workers=(args.workers>0), prefetch_factor=2) if ds_val else None
     dl_test  = DataLoader(ds_test,  batch_size=args.batch_size, shuffle=False, num_workers=args.workers,
-                          collate_fn=collate_varlen, pin_memory=True) if ds_test else None
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+                          collate_fn=collate_varlen, pin_memory=True,
+                          persistent_workers=(args.workers>0), prefetch_factor=2) if ds_test else None
 
     # model(s)
-    extractor = FineTuneSam2Wrapper(args.sam2_cfg, args.sam2_ckpt, device=device).to(device)
+    extractor = FineTuneSam2Wrapper(args.sam2_cfg, args.sam2_ckpt, device=device, max_input_edge=args.max_input_edge).to(device)
     extractor.set_trainable(args.trainable)
+    extractor = extractor.to(memory_format=torch.channels_last)
 
     # probe in_dim
     if len(ds_train) == 0:
@@ -815,19 +888,33 @@ def main():
         optim_groups.append({"params": head_params, "lr": args.lr_head, "weight_decay": args.wd_head})
     opt = torch.optim.AdamW(optim_groups)
 
-
-    # loss
-    if args.focal:
+    # ----- loss -----
+    if args.loss == "focal":
         gamma = 2.0
         alpha = class_weights_ce.to(device) if class_weights_ce is not None else None
-        def focal_loss(logits, target):
+        def loss_fn(logits, target):
             ce = F.cross_entropy(logits, target, reduction="none", weight=alpha)
             pt = torch.softmax(logits, dim=1).gather(1, target.unsqueeze(1)).squeeze(1).clamp_(1e-6, 1.0)
             fl = ((1 - pt) ** gamma) * ce
             return fl.mean()
-        loss_fn = focal_loss
         print("[INFO] Using Focal Loss (gamma=2).")
-    else:
+    elif args.loss == "cb":
+        if counts is None:
+            print("[WARN] counts not found; fallback to CE.")
+            loss_fn = nn.CrossEntropyLoss(label_smoothing=args.smoothing)
+        else:
+            cb_w = _cb_weights_from_counts(counts, beta=args.cb_beta).to(device)
+            loss_fn = nn.CrossEntropyLoss(weight=cb_w, label_smoothing=args.smoothing)
+            print(f"[INFO] Using Class-Balanced CE (beta={args.cb_beta}).")
+    elif args.loss == "ldam":
+        if counts is None:
+            print("[WARN] counts not found; fallback to CE.")
+            loss_fn = nn.CrossEntropyLoss(label_smoothing=args.smoothing)
+        else:
+            cb_w = _cb_weights_from_counts(counts, beta=args.cb_beta).to(device)
+            loss_fn = LDAMLoss(cls_num_list=counts, max_m=0.5, s=30, reweight=None)  # DRW later
+            print("[INFO] Using LDAM; DRW will be activated per epoch if --drw-epoch > 0.")
+    else:  # "ce"
         if (args.balance in ("weights","auto")) and (class_weights_ce is not None) and (imb_ratio is not None and imb_ratio >= 5.0):
             loss_fn = nn.CrossEntropyLoss(weight=class_weights_ce.to(device), label_smoothing=args.smoothing)
             print("[INFO] Using CE with class weights.")
@@ -836,7 +923,8 @@ def main():
 
     # scheduler
     if args.sched == "cosine":
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=min(args.lr_head, args.lr_backbone)*0.01)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs,
+                                                           eta_min=min(args.lr_head, args.lr_backbone)*0.01)
     else:
         sched = None
 
@@ -848,7 +936,6 @@ def main():
             head.load_state_dict(ckpt["head_state"], strict=True)
             print(f"[RESUME] Loaded FULL finetune checkpoint from {args.resume}")
         else:
-            # legacy head-only
             state = ckpt.get("head_state", ckpt)
             try:
                 head.load_state_dict(state, strict=True)
@@ -863,42 +950,56 @@ def main():
     logger = TrainingLogger(log_file)
 
     try:
-        best_acc = -1.0
+        best_metric = -1.0  # macro-F1
         best_epoch = -1
         patience_left = args.patience
         best_path = out_dir / "best_full_finetune.pt"
 
         for epoch in range(1, args.epochs + 1):
+            # DRW: activate in the given epoch (for LDAM)
+            if args.loss == "ldam" and (counts is not None) and (args.drw_epoch > 0) and (epoch == args.drw_epoch):
+                cb_w = _cb_weights_from_counts(counts, beta=args.cb_beta).to(device)
+                # rebuild loss_fn with reweight
+                loss_fn = LDAMLoss(cls_num_list=counts, max_m=0.5, s=30, reweight=cb_w)
+                print(f"[INFO] DRW activated at epoch {epoch}: LDAM now uses CB weights.")
+
             # warmup
             if args.warmup_epochs and epoch <= args.warmup_epochs:
                 warmup_ratio = epoch / max(1, args.warmup_epochs)
                 for i, pg in enumerate(opt.param_groups):
-                    base_lr = args.lr_backbone if i == 0 and back_params else args.lr_head
+                    base_lr = args.lr_backbone if (i == 0 and back_params) else args.lr_head
                     pg["lr"] = base_lr * (0.1 + 0.9 * warmup_ratio)
 
-            # 训练
-            tr_loss = train_one_epoch(extractor, head, dl_train, device, opt, epoch, logger,
-                                    loss_fn=loss_fn, max_grad_norm=args.max_grad_norm,
-                                    log_prior=log_prior, logit_adjust_tau=args.logit_adjust,
-                                    amp=args.amp,
-                                    bg_mask_mode=args.bg_mask_mode, bg_mix_p=args.bg_mix_p)
+            # Train
+            tr_loss = train_one_epoch(
+                extractor, head, dl_train, device, opt, epoch, logger,
+                loss_fn=loss_fn, max_grad_norm=args.max_grad_norm,
+                log_prior=log_prior, logit_adjust_tau=args.logit_adjust,
+                amp=args.amp, amp_dtype=amp_dtype,
+                bg_mask_mode=args.bg_mask_mode, bg_mix_p=args.bg_mix_p,
+                accum_steps=args.accum_steps,
+                do_mixup=args.mixup, mixup_alpha=args.mixup_alpha
+            )
 
-            # 验证
-            va_loss, va_acc = evaluate(extractor, head, dl_val, device, epoch, logger,
-                                    loss_fn=loss_fn, split_name="val",
-                                    n_classes=n_classes, id2name=id2name,
-                                    log_prior=log_prior, logit_adjust_tau=args.logit_adjust,
-                                    amp=args.amp,
-                                    bg_mask_mode=args.bg_mask_mode, bg_mix_p=args.bg_mix_p) if dl_val else (0.0, 0.0)
+            # Val
+            va_loss, va_acc, va_metrics = evaluate(
+                extractor, head, dl_val, device, epoch, logger,
+                loss_fn=loss_fn, split_name="val",
+                n_classes=n_classes, id2name=id2name,
+                log_prior=log_prior, logit_adjust_tau=args.logit_adjust,
+                amp=args.amp, amp_dtype=amp_dtype,
+                bg_mask_mode=args.bg_mask_mode, bg_mix_p=args.bg_mix_p
+            ) if dl_val else (0.0, 0.0, {"macro_f1": 0.0})
 
-            print(f"[{epoch:02d}] train_loss {tr_loss:.4f} | val_loss {va_loss:.4f} val_acc {va_acc:.3f}")
+            macro_f1 = va_metrics.get("macro_f1", va_acc)
+            print(f"[{epoch:02d}] train_loss {tr_loss:.4f} | val_loss {va_loss:.4f} val_acc {va_acc:.3f} macroF1 {macro_f1:.3f}")
 
             if sched is not None and (not args.warmup_epochs or epoch > args.warmup_epochs):
                 sched.step()
 
-            improved = (dl_val is None) or (va_acc > best_acc)
+            improved = (dl_val is None) or (macro_f1 > best_metric)
             if improved:
-                best_acc = va_acc
+                best_metric = macro_f1
                 best_epoch = epoch
                 patience_left = args.patience
                 torch.save({
@@ -926,50 +1027,42 @@ def main():
                 logger.write(f"epoch={epoch} SAVED periodic_full -> {ep_path}")
 
             if patience_left <= 0:
-                print(f"Early stopping at epoch {epoch}. Best val acc={best_acc:.4f} (epoch {best_epoch}).")
-                logger.write(f"early_stop best_acc={best_acc:.6f} best_epoch={best_epoch}")
+                print(f"Early stopping at epoch {epoch}. Best val macroF1={best_metric:.4f} (epoch {best_epoch}).")
+                logger.write(f"early_stop best_macroF1={best_metric:.6f} best_epoch={best_epoch}")
                 break
 
         # optional test
         if dl_test:
-            test_loss, test_acc = evaluate(extractor, head, dl_test, device, epoch=best_epoch, logger=logger,
-                                           loss_fn=loss_fn, split_name="test",
-                                           n_classes=n_classes, id2name=id2name,
-                                           log_prior=log_prior, logit_adjust_tau=args.logit_adjust,
-                                           amp=args.amp)
-            print(f"[TEST] loss {test_loss:.4f} acc {test_acc:.3f}")
-            logger.write(f"test_loss={test_loss:.6f} test_acc={test_acc:.6f}")
+            test_loss, test_acc, test_metrics = evaluate(
+                extractor, head, dl_test, device, epoch=best_epoch, logger=logger,
+                loss_fn=loss_fn, split_name="test",
+                n_classes=n_classes, id2name=id2name,
+                log_prior=log_prior, logit_adjust_tau=args.logit_adjust,
+                amp=args.amp, amp_dtype=amp_dtype
+            )
+            print(f"[TEST] loss {test_loss:.4f} acc {test_acc:.3f} macroF1 {test_metrics.get('macro_f1',0):.3f}")
+            logger.write(f"test_loss={test_loss:.6f} test_acc={test_acc:.6f} test_macroF1={test_metrics.get('macro_f1',0):.6f}")
 
-        print(f"Done. Best val acc={best_acc:.4f} at epoch {best_epoch}. Saved finetuned model to: {best_path}")
-        logger.write(f"done best_acc={best_acc:.6f} best_epoch={best_epoch} path={best_path}")
+        print(f"Done. Best val macroF1={best_metric:.4f} at epoch {best_epoch}. Saved finetuned model to: {best_path}")
+        logger.write(f"done best_macroF1={best_metric:.6f} best_epoch={best_epoch} path={best_path}")
     finally:
         logger.close()
 
 if __name__ == "__main__":
     main()
 
-#   --resume /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/best_full_finetune.pt \
 
-# CE + logit-adjust   
 # python /home/wcheng31/sam2_classify/train_sam2_classify_finetune.py \
-#   --epochs 20 --batch-size 16 --seed 123 --patience 5 \
+#   --epochs 30 --batch-size 14 --accum-steps 2 --seed 123 --patience 6 \
 #   --sam2-cfg sam2_hiera_l.yaml \
-#   --trainable image+mask \
-#   --lr-backbone 5e-5 --lr-head 1e-3 \
-#   --wd-backbone 0.05 --wd-head 0.05 \
-#   --balance auto --reweight-alpha 0.5 --bg-factor 0.7 \
-#   --bg-mask-mode mix --bg-mix-p 0.5 \
+#   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_large.pt \
+#   --trainable all \
+#   --lr-backbone 1e-5 --lr-head 2e-3 --warmup-epochs 3 --max-grad-norm 1.0 \
+#   --balance sampler --reweight-alpha 0.3 --bg-factor 0.5 \
+#   --loss cb --cb-beta 0.9999 \
 #   --logit-adjust 0.5 \
-#   --amp
-
-# Focal（先别用 logit-adjust，一次开一个“偏置”更稳)
-# python /home/wcheng31/sam2_classify/train_sam2_classify_finetune.py \
-#   --epochs 20 --batch-size 16 --seed 123 --patience 5 \
-#   --sam2-cfg sam2_hiera_l.yaml \
-#   --trainable image+mask \
-#   --lr-backbone 5e-5 --lr-head 1e-3 \
-#   --wd-backbone 0.05 --wd-head 0.05 \
-#   --balance auto --reweight-alpha 0.5 --bg-factor 0.7 \
 #   --bg-mask-mode mix --bg-mix-p 0.5 \
-#   --focal \
+#   --mixup --mixup-alpha 0.2 \
+#   --head cosine --scale 16 \
+#   --max-input-edge 1280 \
 #   --amp
