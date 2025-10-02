@@ -5,6 +5,12 @@ SAM2 frozen -> (tiny/large 自动适配) -> 轻量 ViT 头 or 原有 MLP 头做�
 - 从 image_feat (C,Hf,Wf) + mask 获取 token，ViT 聚合后用 cls 做分类
 - 每个 epoch 只打印一次 形状 信息（并写日志）
 - 新增：每 epoch 输出混淆矩阵 + per-class Precision/Recall/F1，并保存混淆矩阵图片
+
+改动要点：
+1) ViT 头加入 min_keep_tokens（默认 256），提高前景 token 的保底数量（Large 更稳）。
+2) 没有位置编码时，自动构建 2D sin-cos 位置编码兜底。
+3) 按探测到的 H*W 自适应放宽 vit_max_tokens，避免 Large 被过度池化导致信息损失。
+4) 修正 vit-mlp-ratio 参数名。
 """
 
 import os, json, argparse, random, time, math, hashlib
@@ -156,6 +162,7 @@ class FramePointDataset(Dataset):
                 if str(k) == tool: tool_id = v; break
         if tool_id is None: raise KeyError(f"Tool '{tool}' not in label_map.json")
 
+        # 背景点策略
         if int(tool_id) == 0:
             mode = self.bg_mask_mode
             if mode == "pos":
@@ -516,9 +523,10 @@ class ViTTokenHead(nn.Module):
     def __init__(self, in_dim: int, n_classes: int,
                  num_layers: int = 2, num_heads: int = 4,
                  mlp_ratio: float = 4.0, p_drop: float = 0.05,
-                 max_tokens: int = 1024):          # 默认提到 1024
+                 max_tokens: int = 1024, min_keep_tokens: int = 256):
         super().__init__()
         self.max_tokens = int(max_tokens)
+        self.min_keep_tokens = int(min_keep_tokens)
         self.cls = nn.Parameter(torch.zeros(1, 1, in_dim))
         enc_layer = nn.TransformerEncoderLayer(
             d_model=in_dim, nhead=num_heads,
@@ -530,6 +538,24 @@ class ViTTokenHead(nn.Module):
         self.norm = nn.LayerNorm(in_dim)
         self.fc   = nn.Linear(in_dim, n_classes)
         nn.init.trunc_normal_(self.cls, std=0.02)
+
+    def _build_sincos_pos(self, B, C, H, W, device):
+        y = torch.arange(H, device=device).float()
+        x = torch.arange(W, device=device).float()
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        yy = yy / max(1.0, H); xx = xx / max(1.0, W)
+        freqs = [1.0, 2.0, 4.0, 8.0]
+        pe_list = []
+        for f in freqs:
+            pe_list += [torch.sin(2*math.pi*f*yy), torch.cos(2*math.pi*f*yy),
+                        torch.sin(2*math.pi*f*xx), torch.cos(2*math.pi*f*xx)]
+        pe = torch.stack(pe_list, dim=-1)   # [H,W,4*len(freqs)]
+        if pe.shape[-1] < C:
+            pad = torch.zeros(H, W, C - pe.shape[-1], device=device)
+            pe = torch.cat([pe, pad], dim=-1)
+        elif pe.shape[-1] > C:
+            pe = pe[..., :C]
+        return pe.permute(2,0,1).unsqueeze(0).expand(B, -1, -1, -1).contiguous()  # [B,C,H,W]
 
     def forward(self, img_feat: torch.Tensor, mask: Optional[torch.Tensor] = None, pos: Optional[torch.Tensor] = None):
         B,C,H,W = img_feat.shape
@@ -551,15 +577,19 @@ class ViTTokenHead(nn.Module):
                 mask = F.adaptive_max_pool2d(mask, (Ht, Wt))
             H, W = Ht, Wt
 
-        x = img_feat if pos is None else (img_feat + pos)
+        # 位置编码兜底
+        if pos is None:
+            pos = self._build_sincos_pos(B, C, H, W, img_feat.device)
+
+        x = img_feat + pos
         x = x.permute(0,2,3,1).reshape(B, H*W, C)     # [B,N,C]
 
-        # ---- 掩码不再“太狠”：阈值降到0.3 + TopK保底 ----
+        # ---- 掩码阈值与 TopK 保底 ----
         key_padding = None
         if mask is not None:
             thr = 0.3
             keep = (mask > thr).flatten(1)            # [B,N]
-            Kmin = min(64, H*W)                       # 每样本至少保留的token数
+            Kmin = min(self.min_keep_tokens, H*W)     # 更高的前景保底
             for i in range(B):
                 if int(keep[i].sum().item()) < Kmin:
                     vals = mask[i,0].flatten()
@@ -574,7 +604,7 @@ class ViTTokenHead(nn.Module):
             pad0 = torch.zeros(B,1, dtype=torch.bool, device=x.device)
             key_padding = torch.cat([pad0, key_padding], dim=1)  # [B,1+N]
 
-        x = self.enc(x, src_key_padding_mask=key_padding)
+        x = self.enc(x, src_mask=None, src_key_padding_mask=key_padding)
         cls_out = self.norm(x[:,0])
         return self.fc(cls_out)
 
@@ -583,13 +613,11 @@ def _apply_logit_adjust(logits: torch.Tensor, log_prior: Optional[torch.Tensor],
     if (log_prior is None) or (tau is None) or (tau <= 0): return logits
     return logits - float(tau) * log_prior.view(1, -1).to(logits.device)
 
-# ---- 可视化：保存混淆矩阵图片 ----
 def _save_confmat_figure(cm: np.ndarray, id2name: Dict[int,str], save_path: Path, title: str):
     if not HAS_MPL:
         print(f"[WARN] matplotlib not available, skip saving {save_path}")
         return
     ensure_dir(save_path.parent)
-    # 行归一化用于可视化
     with np.errstate(invalid="ignore", divide="ignore"):
         row_sum = cm.sum(axis=1, keepdims=True)
         cm_norm = np.divide(cm, row_sum, out=np.zeros_like(cm, dtype=float), where=row_sum>0)
@@ -600,7 +628,6 @@ def _save_confmat_figure(cm: np.ndarray, id2name: Dict[int,str], save_path: Path
     ax.set(xticks=np.arange(cm.shape[1]), yticks=np.arange(cm.shape[0]),
            xticklabels=classes, yticklabels=classes, ylabel="GT", xlabel="Pred", title=title)
     plt.setp(ax.get_xticklabels(), rotation=30, ha="right", rotation_mode="anchor")
-    # 写入原始计数
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
             ax.text(j, i, str(int(cm[i, j])), va="center", ha="center", fontsize=7)
@@ -674,13 +701,8 @@ def evaluate(extractor: nn.Module, head: nn.Module, loader: DataLoader, device: 
     correct = 0
     printed_shapes = False
 
-    # per-class (recall统计仍保留)
-    per_cls_total = None
-    per_cls_correct = None
     cm = None
     if n_classes is not None:
-        per_cls_total = torch.zeros(n_classes, dtype=torch.long)
-        per_cls_correct = torch.zeros(n_classes, dtype=torch.long)
         cm = torch.zeros((n_classes, n_classes), dtype=torch.long)
 
     pbar = tqdm(loader, total=len(loader), ncols=100, desc=f"Epoch {epoch} [{split_name}]", leave=False)
@@ -715,18 +737,10 @@ def evaluate(extractor: nn.Module, head: nn.Module, loader: DataLoader, device: 
         correct += (preds == y).sum().item()
 
         if cm is not None:
-            # bincount trick to累计混淆矩阵
             y_cpu = y.view(-1).to("cpu")
             p_cpu = preds.view(-1).to("cpu")
             idx = y_cpu * n_classes + p_cpu
             cm += torch.bincount(idx, minlength=n_classes*n_classes).view(n_classes, n_classes)
-
-        if per_cls_total is not None:
-            for c in range(n_classes):
-                m = (y == c)
-                if m.any():
-                    per_cls_total[c] += int(m.sum().item())
-                    per_cls_correct[c] += int((preds[m] == c).sum().item())
 
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
@@ -735,7 +749,7 @@ def evaluate(extractor: nn.Module, head: nn.Module, loader: DataLoader, device: 
     logger.write(f"epoch={epoch} {split_name}_loss={avg_loss:.6f} {split_name}_acc={acc:.6f}")
     print(f"[{split_name.upper()}] epoch {epoch}  loss={avg_loss:.4f}  acc={acc:.4f}")
 
-    # ---- per-class recall（原逻辑） + Precision/Recall/F1 + 混淆矩阵图 ----
+    # ---- per-class metrics + 混淆矩阵图 ----
     if (cm is not None) and (id2name is not None):
         cm_np = cm.numpy()
         tp = np.diag(cm_np)
@@ -746,14 +760,12 @@ def evaluate(extractor: nn.Module, head: nn.Module, loader: DataLoader, device: 
         precision = np.divide(tp, pred_per_cls + eps)
         f1 = np.where((precision+recall) < eps, 0.0, 2*precision*recall/(precision+recall))
 
-        # 打印 per-class
         print(f"[{split_name.upper()} per-class metrics] (epoch {epoch})")
         for c in range(cm_np.shape[0]):
             name = id2name.get(c, f"class{c}")
             print(f"  {c:2d} {name:>16s}: P={precision[c]:.4f} R={recall[c]:.4f} F1={f1[c]:.4f} (GT={int(gt_per_cls[c])}, Pred={int(pred_per_cls[c])})")
             logger.write(f"epoch={epoch} {split_name}_percls[{c}][{name}] P={precision[c]:.6f} R={recall[c]:.6f} F1={f1[c]:.6f} GT={int(gt_per_cls[c])} Pred={int(pred_per_cls[c])}")
 
-        # 宏平均（忽略没有出现的类）
         valid_gt = gt_per_cls > 0
         valid_pred = pred_per_cls > 0
         macro_recall = float(recall[valid_gt].mean()) if valid_gt.any() else float("nan")
@@ -762,7 +774,6 @@ def evaluate(extractor: nn.Module, head: nn.Module, loader: DataLoader, device: 
         print(f"[{split_name.upper()} macro] (epoch {epoch}): P={macro_precision:.4f} R={macro_recall:.4f} F1={macro_f1:.4f}")
         logger.write(f"epoch={epoch} {split_name}_macro P={macro_precision:.6f} R={macro_recall:.6f} F1={macro_f1:.6f}")
 
-        # 保存图片
         save_path = SMALLFILE_ROOT / f"cm_{split_name}_epoch{epoch:03d}.png"
         _save_confmat_figure(cm_np, id2name, save_path, title=f"Confusion Matrix [{split_name}] epoch {epoch}")
         print(f"[{split_name.upper()}] confusion matrix saved to: {save_path}")
@@ -805,19 +816,20 @@ def main():
     ap.add_argument("--max-grad-norm", type=float, default=0.0)
     ap.add_argument("--resume", type=str, default=None)
 
-    # ViT 轻量头参数
+    # ViT 轻量头参数（修正参数名）
     ap.add_argument("--vit-layers", type=int, default=2)
     ap.add_argument("--vit-heads",  type=int, default=4)
     ap.add_argument("--vit-drop",   type=float, default=0.05)
     ap.add_argument("--vit-mlp-ratio", type=float, default=4.0)
-    ap.add_argument("--vit-max-tokens", type=int, default=1024, help="cap tokens per sample before Transformer")  # 默认 1024
+    ap.add_argument("--vit-max-tokens", type=int, default=1024, help="cap tokens per sample before Transformer")
+    ap.add_argument("--vit-min-keep",  type=int, default=256,  help="per-sample minimum foreground tokens kept")
 
     # balancing / focal / logit-adjust
     ap.add_argument("--balance", choices=["none","weights","sampler","auto"], default="auto")
     ap.add_argument("--focal", action="store_true")
-    ap.add_argument("--reweight-alpha", type=float, default=1.0)  # 更强扶少
-    ap.add_argument("--bg-factor", type=float, default=0.1)       # 明显压背景
-    ap.add_argument("--logit-adjust", type=float, default=1.0)    # 默认开启 Balanced Softmax
+    ap.add_argument("--reweight-alpha", type=float, default=1.0)
+    ap.add_argument("--bg-factor", type=float, default=0.1)
+    ap.add_argument("--logit-adjust", type=float, default=1.0)
 
     # 背景掩码策略
     ap.add_argument("--bg-mask-mode", choices=["pos","global","mix"], default="mix")
@@ -842,7 +854,7 @@ def main():
     if args.head == "vit": out_dir = out_dir / "vit_head"
     ensure_dir(out_dir); ensure_dir(SMALLFILE_ROOT)
 
-    # 使用现成 split
+    # 使用现成 split（按你的环境）
     train_csv = SMALLFILE_ROOT / "train_manifest_10.csv"
     val_csv   = SMALLFILE_ROOT / "val_manifest_10.csv"
     test_csv  = SMALLFILE_ROOT / "test_manifest_10.csv"
@@ -907,13 +919,19 @@ def main():
     probe = next(iter(dl_train))
     with torch.no_grad():
         if args.head == "vit":
-            img_feat, mask, img_pe = extractor(probe["images"][:1], probe["points"][:1], probe["meta"][:1], return_4d=True)
-            C = int(img_feat.shape[1]); in_dim = C
-            print(f"[PROBE] img_feat={tuple(img_feat.shape)} mask={tuple(mask.shape)} pos={None if img_pe is None else tuple(img_pe.shape)}")
+            img_feat_probe, mask_probe, img_pe_probe = extractor(probe["images"][:1], probe["points"][:1], probe["meta"][:1], return_4d=True)
+            C = int(img_feat_probe.shape[1]); in_dim = C
+            H1, W1 = int(img_feat_probe.shape[-2]), int(img_feat_probe.shape[-1])
+            N1 = H1 * W1
+            # 自适应放宽 vit_max_tokens，最多 4096；避免 Large 被强行压到很小
+            auto_max_tokens = max(args.vit_max_tokens, min(4096, int(1.25 * N1)))
+            print(f"[PROBE] img_feat={tuple(img_feat_probe.shape)} mask={tuple(mask_probe.shape)} pos={'None' if img_pe_probe is None else tuple(img_pe_probe.shape)}")
+            print(f"[VIT] auto_max_tokens={auto_max_tokens} (from N={N1})")
         else:
             vec = extractor(probe["images"][:1], probe["points"][:1], probe["meta"][:1], return_4d=False)
             in_dim = int(vec.shape[-1])
             print(f"[PROBE] pooled_vec={tuple(vec.shape)}")
+            auto_max_tokens = None
     n_classes = len(tool2id)
 
     # build head
@@ -921,8 +939,9 @@ def main():
     if args.head == "vit":
         head = ViTTokenHead(in_dim=in_dim, n_classes=n_classes,
                             num_layers=args.vit_layers, num_heads=args.vit_heads,
-                            mlp_ratio=args.vit_mlpp_ratio if hasattr(args, "vit_mlpp_ratio") else args.vit_mlp_ratio,
-                            p_drop=args.vit_drop, max_tokens=args.vit_max_tokens).to(device)
+                            mlp_ratio=args.vit_mlp_ratio, p_drop=args.vit_drop,
+                            max_tokens=auto_max_tokens, min_keep_tokens=args.vit_min_keep).to(device)
+        print(f"[VIT] max_tokens={auto_max_tokens}  min_keep_tokens={args.vit_min_keep}")
     elif args.head == "linear":
         head = MLPHead(in_dim, n_classes, hidden=0, drop=args.drop).to(device)
     elif args.head == "mlp":
@@ -1006,8 +1025,6 @@ def main():
             else:
                 patience_left -= 1
 
-            # 保存一个 val 的混淆矩阵图已在 evaluate 内完成
-
             if (epoch % 5 == 0) or (epoch == args.epochs):
                 ep_path = out_dir / f"head_epoch{epoch:03d}.pt"
                 torch.save({"head_state": head.state_dict(),"in_dim": in_dim,"n_classes": n_classes,
@@ -1036,15 +1053,29 @@ def main():
 if __name__ == "__main__":
     main()
 
-
+# Tiny Sam2
 # python /home/wcheng31/sam2_classify/train_sam2_classify_vit.py \
 #   --backend official \
 #   --epochs 20 --batch-size 256 --val-batch-size 64 \
 #   --seed 123 --patience 5 \
 #   --sam2-cfg sam2_hiera_t.yaml \
 #   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_tiny.pt \
-#   --bg-mask-mode mix --logit-adjust 0.5 \
+#   --bg-mask-mode mix --logit-adjust 1.0 \
 #   --head vit --vit-layers 2 --vit-heads 4 --vit-drop 0.05 \
-#   --vit-max-tokens 512 \
-#   --balance sampler --focal --reweight-alpha 1.0 --bg-factor 0.1 --logit-adjust 1.0
+#   --vit-max-tokens 1024 --vit-min-keep 256 \
+#   --balance sampler --focal --reweight-alpha 1.0 --bg-factor 0.1
+
+# Large sam2
+# python /home/wcheng31/sam2_classify/train_sam2_classify_vit.py \
+#   --backend official \
+#   --epochs 20 --batch-size 128 --val-batch-size 64 \
+#   --seed 123 --patience 5 \
+#   --sam2-cfg sam2_hiera_l.yaml \
+#   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_large.pt \
+#   --bg-mask-mode mix --logit-adjust 1.0 \
+#   --head vit --vit-layers 3 --vit-heads 8 --vit-drop 0.1 \
+#   --vit-max-tokens 4096 \
+#   --lr 8e-4 \
+#   --balance sampler --focal --reweight-alpha 1.0 --bg-factor 0.1
+
 
