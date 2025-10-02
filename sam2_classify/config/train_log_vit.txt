@@ -15732,3 +15732,26 @@
 [2025-09-26 21:07:38] epoch=2 step=440/1690 train_loss=0.081436
 [2025-09-26 21:07:44] epoch=2 step=441/1690 train_loss=0.104395
 [2025-09-26 21:07:51] epoch=2 step=442/1690 train_loss=0.059165
+[2025-10-02 19:23:10] epoch=1 [shapes/train] x=[128,256,20,40] -> logits=[128,5]
+[2025-10-02 19:23:11] epoch=1 step=1/3380 train_loss=1.284968
+[2025-10-02 19:23:18] epoch=1 step=2/3380 train_loss=1.878976
+[2025-10-02 19:23:25] epoch=1 step=3/3380 train_loss=2.710740
+[2025-10-02 19:23:32] epoch=1 step=4/3380 train_loss=1.813530
+[2025-10-02 19:23:39] epoch=1 step=5/3380 train_loss=1.573176
+[2025-10-02 19:23:46] epoch=1 step=6/3380 train_loss=1.042953
+[2025-10-02 19:23:54] epoch=1 step=7/3380 train_loss=0.954122
+[2025-10-02 19:24:01] epoch=1 step=8/3380 train_loss=1.074665
+[2025-10-02 19:24:08] epoch=1 step=9/3380 train_loss=1.035174
+[2025-10-02 19:24:16] epoch=1 step=10/3380 train_loss=0.975332
+[2025-10-02 19:24:23] epoch=1 step=11/3380 train_loss=0.847309
+[2025-10-02 19:24:30] epoch=1 step=12/3380 train_loss=0.851578
+[2025-10-02 19:24:37] epoch=1 step=13/3380 train_loss=0.898200
+[2025-10-02 19:24:44] epoch=1 step=14/3380 train_loss=0.919850
+[2025-10-02 19:24:51] epoch=1 step=15/3380 train_loss=0.989260
+[2025-10-02 19:24:59] epoch=1 step=16/3380 train_loss=0.961967
+[2025-10-02 19:25:06] epoch=1 step=17/3380 train_loss=0.916712
+[2025-10-02 19:25:13] epoch=1 step=18/3380 train_loss=0.844645
+[2025-10-02 19:25:21] epoch=1 step=19/3380 train_loss=0.820061
+[2025-10-02 19:25:28] epoch=1 step=20/3380 train_loss=0.794325
+[2025-10-02 19:25:35] epoch=1 step=21/3380 train_loss=0.851708
+[2025-10-02 19:25:42] epoch=1 step=22/3380 train_loss=0.889223
