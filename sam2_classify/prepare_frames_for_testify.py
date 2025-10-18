@@ -28,7 +28,7 @@ VIDEO_LIST_STR = "video01,video02,video03,video04,video05,video06,video07,video0
 # 源数据默认根目录
 DEF_ROOT = "/projects/surgical-video-digital-twin/datasets/cholec80_raw/annotated_data"
 # 输出默认目录
-DEF_OUT  = "/projects/surgical-video-digital-twin/ood_test_5cls"
+DEF_OUT  = ""
 
 
 OBJID_TO_NAME = {
@@ -59,12 +59,13 @@ def map_objid_to_5cls(obj_id: int) -> str:
 LABEL_MAP_5CLS = {
     "tool_to_id": {
         "background": 0,
-        "grasper": 1,
-        "hook": 2,
-        "scissors": 3,
-        "clipper": 4,
+        "clipper": 1,
+        "grasper": 2,
+        "hook": 3,
+        "scissors": 4
     }
 }
+
 
 def parse_video_list(s: str) -> List[str]:
     """
@@ -182,22 +183,31 @@ def main():
                         x, y = pts[i][:2]
                         pos_points.append([float(x), float(y), 1.0])
 
+                                # === 构造与 combined 一致的行结构 ===
                 row = {
+                    "frame_file": frame_file,
+                    "tool": mapped,          # 新增列，保持与 combined 数据一致
+                    "label": mapped_id,      # 新增列
+                    # 以下为辅助信息，保留不影响训练
                     "video": vid,
                     "frame_id": int(frm.get("frame_id", -1)),
-                    "frame_file": frame_file,
                     "image_path": str(img_path),
                     "obj_id": obj_id,
                     "obj_name": OBJID_TO_NAME.get(obj_id, f"obj{obj_id}"),
-                    "mapped_class": mapped,
-                    "class_id": mapped_id,
                     "num_points": len(pos_points),
                     "points_json": json.dumps(pos_points, ensure_ascii=False),
                 }
                 rows.append(row)
                 stats["per_class"][mapped] += 1
 
+    # === 输出阶段 ===
     df = pd.DataFrame(rows)
+
+    # 保证列顺序与 combined 完全相同（多余列放后面）
+    preferred_cols = ["frame_file", "tool", "label"]
+    other_cols = [c for c in df.columns if c not in preferred_cols]
+    df = df[preferred_cols + other_cols]
+
     out_mani = out_root / "manifest.csv"
     out_lbl  = out_root / "label_map.json"
     out_stat = out_root / "stats.json"
@@ -205,7 +215,6 @@ def main():
     if len(df) == 0:
         print("[WARN] 没有生成任何样本（可能是所有对象都没有 labels==1 的点）")
     else:
-        # 按视频、帧排序更直观
         df.sort_values(by=["video", "frame_id", "obj_id"], inplace=True)
 
     df.to_csv(out_mani, index=False)
@@ -217,11 +226,12 @@ def main():
 
     print(f"Done.\n- manifest: {out_mani}\n- label_map: {out_lbl}\n- stats: {out_stat}\nSamples: {len(df)}")
 
+
 if __name__ == "__main__":
     main()
 
-# 用的是cholec80 video41-50
-# python build_ood_5cls_manifest.py \
+# 用的是cholec80 video41-50 /projects/surgical-video-digital-twin/Wenzheng/IPCAI
+# python /home/wcheng31/sam2_classify/prepare_frames_for_testify.py \
 #   --root /projects/surgical-video-digital-twin/datasets/cholec80_raw/annotated_data \
 #   --videos "video41-video50" \
-#   --out-root /projects/surgical-video-digital-twin/ood_test_5cls
+#   --out-root /projects/surgical-video-digital-twin/Wenzheng/IPCAI/cholec80_test41-80

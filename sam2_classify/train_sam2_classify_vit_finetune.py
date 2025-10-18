@@ -1,22 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-SAM2 frozen -> (tiny/large 自动适配) -> 轻量 ViT 头 or 原有 MLP 头做分类
-- 从 image_feat (C,Hf,Wf) + mask 获取 token，ViT 聚合后用 cls 做分类
-- 每个 epoch 只打印一次 形状 信息（并写日志）
-- 新增：每 epoch 输出混淆矩阵 + per-class Precision/Recall/F1，并保存混淆矩阵图片
-
-改动要点：
-1) ViT 头加入 min_keep_tokens（默认 256），提高前景 token 的保底数量（Large 更稳）。
-2) 没有位置编码时，自动构建 2D sin-cos 位置编码兜底。
-3) 按探测到的 H*W 自适应放宽 vit_max_tokens，避免 Large 被过度池化导致信息损失。
-4) 修正 vit-mlp-ratio 参数名。
-"""
 
 import os, json, argparse, random, time, math, hashlib
 from collections import OrderedDict
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional, Union
+from typing import List, Tuple, Dict, Optional
 
 import cv2
 import numpy as np
@@ -26,7 +14,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-# ---- plotting (优雅降级) ----
+# ---- tqdm ----
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(x, **k): return x
+
+# ---- plotting (optional) ----
 HAS_MPL = True
 try:
     import matplotlib
@@ -35,12 +29,7 @@ try:
 except Exception:
     HAS_MPL = False
 
-try:
-    from tqdm import tqdm
-except ImportError:
-    def tqdm(x, **k): return x
-
-# ----------------- Hydra 初始化：关键修复 -----------------
+# ----------------- Hydra 初始化 -----------------
 from hydra.core.global_hydra import GlobalHydra
 from hydra import initialize
 
@@ -56,7 +45,6 @@ from sam2.backup.build_sam import build_sam2
 SMALLFILE_ROOT = Path("/home/wcheng31/sam2_classify/config")
 PRETRAIN_ROOT  = Path("/projects/surgical-video-digital-twin/pretrain_params")
 CKPT_ROOT      = PRETRAIN_ROOT / "cwz" / "sam2_classifier"
-DATASET_ROOT   = Path("/projects/surgical-video-digital-twin/datasets/sam2_classifier")
 
 # ---------- Utils ----------
 def set_seed(seed: int = 42):
@@ -122,14 +110,6 @@ class FramePointDataset(Dataset):
                 return len(arr) > 0
             except Exception:
                 return False
-        # 兼容 OOD 清单列名
-        if "tool" not in self.df.columns:
-            if "mapped_class" in self.df.columns:
-                self.df["tool"] = self.df["mapped_class"].astype(str)
-            elif "class" in self.df.columns:
-                self.df["tool"] = self.df["class"].astype(str)
-            else:
-                raise KeyError("Neither 'tool' nor 'mapped_class' found in manifest.")
         self.df = self.df[self.df["points_json"].apply(has_points)].reset_index(drop=True)
 
     def __len__(self): return len(self.df)
@@ -205,38 +185,24 @@ def collate_varlen(batch):
     metas   = [b["meta"]   for b in batch]
     return {"images": images, "points": points, "targets": targets, "meta": metas}
 
-# --- tiny helper: binary mask erosion to reduce spillover ---
-def _erode_binary_mask(m: torch.Tensor, k: int = 3) -> torch.Tensor:
-    """
-    Erode a [B,1,H,W] soft/binary mask in [0,1] with a kxk window using
-    max-pooling on the complement. Keeps dtype/device, no in-place ops.
-    """
-    if m is None: 
-        return m
-    if k is None or k <= 1:
-        return m
-    # ensure float for pooling math
-    m = m.float()
-    # erosion: m_erode = 1 - maxpool(1 - m)
-    return 1.0 - F.max_pool2d(1.0 - m, kernel_size=int(k), stride=1, padding=int(k)//2)
-
-
-# ---------- SAM2 Wrapper ----------
+# ---------- SAM2 Wrapper (可训练) ----------
 class Sam2OfficialWrapper(nn.Module):
     def __init__(self, cfg: str, ckpt: str, device: str = "cuda", cache_size: int = 128):
         super().__init__()
         self.device = device
         setup_hydra_configs()
         self.model = build_sam2(cfg, ckpt, device=device)
-        self.model.to(self.device); self.model.eval()
-        for p in self.model.parameters(): p.requires_grad_(False)
+        self.model.to(self.device)
+        for p in self.model.parameters(): p.requires_grad_(True)
+        self.model.train()
+
         self.verbose = False
         self._printed_resize = False
         self._norm_cached: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self.cache: "OrderedDict[str, Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]], float, float]]" = OrderedDict()
         self.cache_size = int(cache_size)
 
-    # ---- infer legal size ----
+    # ---- size utils ----
     def _infer_patch_conv(self):
         enc = getattr(self.model, "image_encoder", None)
         trunk = getattr(enc, "trunk", None)
@@ -290,7 +256,6 @@ class Sam2OfficialWrapper(nn.Module):
         ps = torch.tensor([0.229,0.224,0.225], device=self.device).view(1,3,1,1)
         self._norm_cached = (pm,ps); return self._norm_cached
 
-    @torch.no_grad()
     def _preprocess_manual(self, img_bgr: np.ndarray):
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         H0,W0 = img_rgb.shape[:2]
@@ -301,8 +266,6 @@ class Sam2OfficialWrapper(nn.Module):
         img_t = (img_t.to(self.device, non_blocking=True) - pm)/ps
         return img_t, (H0,W0), (H_in,W_in), sy, sx
 
-
-    @torch.no_grad()
     def _get_image_embed(self, img_t: torch.Tensor):
         out = self.model.image_encoder(img_t)
         if isinstance(out, dict) and ("vision_features" in out):
@@ -337,7 +300,7 @@ class Sam2OfficialWrapper(nn.Module):
             img_feat = img_feat.to(self.device, non_blocking=True)
             if isinstance(img_pe, torch.Tensor): img_pe = img_pe.to(self.device, non_blocking=True)
             return img_feat, img_pe, high_res
-        # fallback: 收集 4D tensor
+        # fallback
         tensors = []
         def collect(o):
             if torch.is_tensor(o): tensors.append(o)
@@ -351,7 +314,6 @@ class Sam2OfficialWrapper(nn.Module):
         img_feat = max(cand, key=lambda t: int(t.shape[-2])*int(t.shape[-1]))
         return img_feat.to(self.device, non_blocking=True), None, None
 
-    @torch.no_grad()
     def _encode_prompts(self, coords: torch.Tensor, labels: torch.Tensor):
         pe = getattr(self.model, "prompt_encoder", None) or getattr(self.model, "sam_prompt_encoder", None)
         if pe is None: raise AttributeError("No prompt_encoder in model")
@@ -376,7 +338,6 @@ class Sam2OfficialWrapper(nn.Module):
         pad = x.new_zeros((b, out_ch-c, h, w))
         return torch.cat([x, pad], dim=1)
 
-    @torch.no_grad()
     def _probe_dc_out_channels(self, md: nn.Module, image_feat: torch.Tensor):
         def _last_conv_out_channels(mod: nn.Module) -> Optional[int]:
             last = None
@@ -388,7 +349,6 @@ class Sam2OfficialWrapper(nn.Module):
         if (c1 is not None) and (c2 is not None): return c1, c2
         return 64, 32
 
-    @torch.no_grad()
     def _decode_mask(self, image_feat, image_pe, sparse_pe, dense_pe, high_res):
         md = getattr(self.model, "mask_decoder", None) or getattr(self.model, "sam_mask_decoder", None)
         if md is None: raise AttributeError("No mask_decoder in model")
@@ -410,55 +370,32 @@ class Sam2OfficialWrapper(nn.Module):
         if isinstance(out, dict): return out.get("masks", out.get("mask_logits"))
         return out
 
-    @torch.no_grad()
     def _align_batch_4d(self, feats_triplets):
-        """
-        Align a list of (img_feat, mask, pos) 4D tensors to a common spatial size.
-        IMPORTANT CHANGE: pad smaller maps up to the *maximum* H×W in the batch,
-        instead of pooling everything down to the minimum. This avoids systematic
-        information loss when batching.
-        """
-        # current sizes
         sizes = [t[0].shape[-2:] for t in feats_triplets]
-        tgt_h = max(h for h, _ in sizes)
-        tgt_w = max(w for _, w in sizes)
-
-        def _pad_to(x, size_hw):
-            if x is None:
-                return None
-            h, w = x.shape[-2], x.shape[-1]
-            if (h, w) == size_hw:
-                return x
-            pad_h = size_hw[0] - h
-            pad_w = size_hw[1] - w
-            # pad (left, right, top, bottom) = (0, pad_w, 0, pad_h)
-            return F.pad(x, (0, pad_w, 0, pad_h), mode="constant", value=0.0)
-
+        tgt_h = min(h for h, _ in sizes)
+        tgt_w = min(w for _, w in sizes)
+        def _pool_to(x, size_hw):
+            if x is None: return None
+            if x.shape[-2:] == size_hw: return x
+            return F.adaptive_avg_pool2d(x, size_hw)
         img_feats, masks, pos = [], [], []
         for (ff, mm, pp) in feats_triplets:
-            ff_p = _pad_to(ff, (tgt_h, tgt_w))
-            mm_p = _pad_to(mm, (tgt_h, tgt_w)) if mm is not None else None
-            if pp is None:
-                # keep shape-consistent with zeros
-                pp_p = torch.zeros_like(ff_p)
-            else:
-                pp_p = _pad_to(pp, (tgt_h, tgt_w))
-            # if mask None (shouldn't happen here), create all-ones to avoid dropping tokens
-            if mm_p is None:
-                mm_p = torch.ones((ff_p.shape[0], 1, tgt_h, tgt_w), device=ff_p.device, dtype=ff_p.dtype)
-            img_feats.append(ff_p); masks.append(mm_p); pos.append(pp_p)
-
+            ff_r = _pool_to(ff, (tgt_h, tgt_w))
+            mm_r = _pool_to(mm, (tgt_h, tgt_w))
+            if pp is None: pp_r = torch.zeros_like(ff_r)
+            else: pp_r = _pool_to(pp, (tgt_h, tgt_w))
+            img_feats.append(ff_r); masks.append(mm_r); pos.append(pp_r)
         img_feat_b = torch.cat(img_feats, dim=0)
         mask_b     = torch.cat(masks,    dim=0)
         pos_b      = torch.cat(pos,      dim=0)
         return img_feat_b, mask_b, pos_b
 
-
-    @torch.no_grad()
     def forward(self, images_bgr: List[np.ndarray], points_list: List[np.ndarray],
                 metas: Optional[List[dict]] = None, return_4d: bool = False):
         feats_triplets = []
         for i, (img_bgr, pts_np) in enumerate(zip(images_bgr, points_list)):
+            use_cache = (not self.training) and (self.cache_size > 0)
+
             key = None
             if metas is not None and i < len(metas):
                 p = metas[i].get("image_path", None)
@@ -467,16 +404,16 @@ class Sam2OfficialWrapper(nn.Module):
             if key is None:
                 key = f"sig::{self._img_signature(img_bgr)}"
 
-            cached = self._cache_get(key)
+            cached = self._cache_get(key) if use_cache else None
             if cached is None:
                 img_t, _, _, sy, sx = self._preprocess_manual(img_bgr)
                 img_feat, img_pe, high_res = self._get_image_embed(img_t)
-                cached = (img_feat, img_pe, high_res, sy, sx)
-                self._cache_put(key, cached)
+                if use_cache:
+                    self._cache_put(key, (img_feat, img_pe, high_res, sy, sx))
             else:
                 img_feat, img_pe, high_res, sy, sx = cached
 
-            # ---- 生成掩码（含兜底）----
+            # ---- 生成掩码 ----
             if pts_np is None or len(pts_np) == 0:
                 mask = torch.ones((1, 1, img_feat.shape[-2], img_feat.shape[-1]), device=self.device)
             else:
@@ -488,13 +425,11 @@ class Sam2OfficialWrapper(nn.Module):
                     sp, dp = self._encode_prompts(coords, labels)
                     mask_logits = self._decode_mask(img_feat, img_pe, sp, dp, high_res)
                     mask = torch.sigmoid(mask_logits)
-                    # 轻度腐蚀，减少边界溢出（对 scissors/细长器械更稳）
-                    mask = _erode_binary_mask(mask, k=3)
-
                     if mask.shape[-2:] != img_feat.shape[-2:]:
                         mask = F.interpolate(mask, size=img_feat.shape[-2:], mode="bilinear", align_corners=False)
                     if (not torch.isfinite(mask).all()) or (mask.sum() <= 1e-5):
                         mask = torch.ones((1, 1, img_feat.shape[-2], img_feat.shape[-1]), device=self.device)
+
             feats_triplets.append((img_feat, mask, img_pe))
 
         if return_4d:
@@ -513,7 +448,7 @@ class Sam2OfficialWrapper(nn.Module):
         ch = img.shape[2] if img.ndim == 3 else 1
         prefix = img.ravel()[:4096].tobytes()
         sig = hashlib.md5(prefix).hexdigest()
-        return f"{h}x{w}x{ch}:{img.dtype.str}:{sig}"
+        return f"{h}xw{w}x{ch}:{img.dtype.str}:{sig}"
 
     def _cache_get(self, key: str):
         v = self.cache.get(key)
@@ -531,7 +466,6 @@ class Sam2OfficialWrapper(nn.Module):
         pts[:, 0] *= sx; pts[:, 1] *= sy
         return torch.from_numpy(pts[:, :2]).unsqueeze(0).float()
 
-
 # ---------- Heads ----------
 class MLPHead(nn.Module):
     def __init__(self, in_dim: int, n_classes: int, hidden: int = 0, drop: float = 0.0):
@@ -546,17 +480,6 @@ class MLPHead(nn.Module):
         if not self._deep: return self.fc(x)
         x = self.fc1(x); x = self.act(x); x = self.drop(x); x = self.fc2(x); return x
 
-class MLPBNHead(nn.Module):
-    def __init__(self, in_dim: int, n_classes: int, hidden_layers: List[int], drop: float = 0.0):
-        super().__init__()
-        dims = [in_dim] + list(hidden_layers)
-        layers = []
-        for i in range(len(dims)-1):
-            layers += [nn.Linear(dims[i], dims[i+1]), nn.BatchNorm1d(dims[i+1]), nn.GELU()]
-            if drop and drop > 0: layers.append(nn.Dropout(drop))
-        self.mlp = nn.Sequential(*layers); self.out = nn.Linear(dims[-1], n_classes)
-    def forward(self, x): return self.out(self.mlp(x))
-
 class CosineClassifier(nn.Module):
     def __init__(self, in_dim: int, n_classes: int, scale: float = 16.0):
         super().__init__()
@@ -570,14 +493,11 @@ class ViTTokenHead(nn.Module):
     def __init__(self, in_dim: int, n_classes: int,
                  num_layers: int = 2, num_heads: int = 4,
                  mlp_ratio: float = 4.0, p_drop: float = 0.05,
-                 max_tokens: int = 1024, min_keep_tokens: int = 256,
-                 mask_thr: float = 0.3, debug: bool = False):
+                 max_tokens: int = 1024, min_keep_tokens: int = 256):
         super().__init__()
         self.max_tokens = int(max_tokens)
         self.min_keep_tokens = int(min_keep_tokens)
-        self.mask_thr = float(mask_thr)
-        self.debug = bool(debug)
-
+        self.last_token_count = None  # 记录本次 forward 的 token 数（H*W）
         self.cls = nn.Parameter(torch.zeros(1, 1, in_dim))
         enc_layer = nn.TransformerEncoderLayer(
             d_model=in_dim, nhead=num_heads,
@@ -590,21 +510,17 @@ class ViTTokenHead(nn.Module):
         self.fc   = nn.Linear(in_dim, n_classes)
         nn.init.trunc_normal_(self.cls, std=0.02)
 
-        # runtime stats for logging
-        self._last_stats = None  # {'N_raw','N_cap','kept_avg','keep_ratio','topk_hits'}
-
     def _build_sincos_pos(self, B, C, H, W, device):
         y = torch.arange(H, device=device).float()
         x = torch.arange(W, device=device).float()
         yy, xx = torch.meshgrid(y, x, indexing="ij")
-        yy = yy / max(1.0, H)
-        xx = xx / max(1.0, W)
+        yy = yy / max(1.0, H); xx = xx / max(1.0, W)
         freqs = [1.0, 2.0, 4.0, 8.0]
         pe_list = []
         for f in freqs:
             pe_list += [torch.sin(2*math.pi*f*yy), torch.cos(2*math.pi*f*yy),
                         torch.sin(2*math.pi*f*xx), torch.cos(2*math.pi*f*xx)]
-        pe = torch.stack(pe_list, dim=-1)  # [H,W,4*len(freqs)]
+        pe = torch.stack(pe_list, dim=-1)
         if pe.shape[-1] < C:
             pad = torch.zeros(H, W, C - pe.shape[-1], device=device)
             pe = torch.cat([pe, pad], dim=-1)
@@ -613,82 +529,50 @@ class ViTTokenHead(nn.Module):
         return pe.permute(2,0,1).unsqueeze(0).expand(B, -1, -1, -1).contiguous()
 
     def forward(self, img_feat: torch.Tensor, mask: Optional[torch.Tensor] = None, pos: Optional[torch.Tensor] = None):
-        B, C, H, W = img_feat.shape
-        N_raw = H * W
-
-        # cap tokens by adaptive pooling
-        if N_raw > self.max_tokens:
-            s = math.sqrt(N_raw / float(self.max_tokens))
+        B,C,H,W = img_feat.shape
+        # 限顶 tokens
+        N = H * W
+        if N > self.max_tokens:
+            s = math.sqrt(N / float(self.max_tokens))
             Ht = max(1, int(H / s + 0.5))
             Wt = max(1, int(W / s + 0.5))
             while Ht * Wt > self.max_tokens:
                 if Ht >= Wt and Ht > 1: Ht -= 1
                 elif Wt > 1:            Wt -= 1
-                else:                   break
+                else: break
             img_feat = F.adaptive_avg_pool2d(img_feat, (Ht, Wt))
-            if pos is not None:
-                pos = F.adaptive_avg_pool2d(pos, (Ht, Wt))
-            if mask is not None:
-                mask = F.adaptive_max_pool2d(mask, (Ht, Wt))
+            if pos is not None:  pos  = F.adaptive_avg_pool2d(pos,  (Ht, Wt))
+            if mask is not None: mask = F.adaptive_max_pool2d(mask, (Ht, Wt))
             H, W = Ht, Wt
-        N_cap = H * W
+        self.last_token_count = H * W  # <<< 记录送入 Transformer 的 token 个数（不含 cls）
 
-        # pos enc fallback
         if pos is None:
             pos = self._build_sincos_pos(B, C, H, W, img_feat.device)
 
-        x = img_feat + pos
-        x = x.permute(0, 2, 3, 1).reshape(B, H * W, C)  # [B,N,C]
+        x = (img_feat + pos).permute(0,2,3,1).reshape(B, H*W, C)
 
-        # key padding from mask with Top-K safety
         key_padding = None
-        kept_total = 0
-        topk_hits = 0
         if mask is not None:
-            thr = self.mask_thr
-            keep = (mask > thr).flatten(1)  # [B,N]
-            Kmin = min(self.min_keep_tokens, H * W)
+            thr = 0.3
+            keep = (mask > thr).flatten(1)          # [B,N]
+            Kmin = min(self.min_keep_tokens, H*W)
             for i in range(B):
                 if int(keep[i].sum().item()) < Kmin:
-                    vals = mask[i, 0].flatten()
+                    vals = mask[i,0].flatten()
                     k = min(Kmin, vals.numel())
                     topk = torch.topk(vals, k=k, dim=0).indices
-                    keep[i].zero_()
-                    keep[i, topk] = True
-                    topk_hits += 1
-                kept_total += int(keep[i].sum().item())
-            key_padding = (~keep).bool()  # True = pad
+                    keep[i].zero_(); keep[i, topk] = True
+            key_padding = (~keep).bool()
 
-        cls = self.cls.expand(B, -1, -1)             # [B,1,C]
-        x = torch.cat([cls, x], dim=1)               # [B,1+N,C]
+        cls = self.cls.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)
         if key_padding is not None:
-            pad0 = torch.zeros(B, 1, dtype=torch.bool, device=x.device)
-            key_padding = torch.cat([pad0, key_padding], dim=1)  # [B,1+N]
+            pad0 = torch.zeros(B,1, dtype=torch.bool, device=x.device)
+            key_padding = torch.cat([pad0, key_padding], dim=1)
 
         x = self.enc(x, src_key_padding_mask=key_padding)
-        cls_out = self.norm(x[:, 0])
-
-        # stats
-        if self.debug and mask is not None:
-            kept_avg = kept_total / max(1, B)
-            keep_ratio = kept_avg / max(1, N_cap)
-            self._last_stats = {
-                "N_raw": int(N_raw),
-                "N_cap": int(N_cap),
-                "kept_avg": int(kept_avg),
-                "keep_ratio": float(keep_ratio),
-                "topk_hits": int(topk_hits),
-            }
-        else:
-            self._last_stats = None
-
+        cls_out = self.norm(x[:,0])
         return self.fc(cls_out)
-
-    def pop_last_stats(self):
-        s = self._last_stats
-        self._last_stats = None
-        return s
-
 
 # ---------- Train / Eval ----------
 def _apply_logit_adjust(logits: torch.Tensor, log_prior: Optional[torch.Tensor], tau: float):
@@ -721,21 +605,23 @@ def train_one_epoch(extractor: nn.Module, head: nn.Module, loader: DataLoader, d
                     optimizer: torch.optim.Optimizer, epoch: int, logger: TrainingLogger, loss_fn,
                     max_grad_norm: float = 0.0, log_prior: Optional[torch.Tensor] = None,
                     logit_adjust_tau: float = 0.0, head_type: str = "vit"):
+    extractor.train()
     head.train()
     running_loss, n = 0.0, 0
     printed_shapes = False
+    printed_tokens = False
+
     pbar = tqdm(loader, total=len(loader), ncols=100, desc=f"Epoch {epoch} [train]", leave=False)
     for step, batch in enumerate(pbar, 1):
         imgs, pts, metas = batch["images"], batch["points"], batch["meta"]
         y = batch["targets"].to(device)
 
-        with torch.no_grad():
-            if head_type == "vit":
-                img_feat, mask, img_pe = extractor(imgs, pts, metas, return_4d=True)
-                feats_for_head = (img_feat, mask, img_pe)
-            else:
-                vecs = extractor(imgs, pts, metas, return_4d=False)
-                feats_for_head = vecs
+        if head_type == "vit":
+            img_feat, mask, img_pe = extractor(imgs, pts, metas, return_4d=True)
+            feats_for_head = (img_feat, mask, img_pe)
+        else:
+            vecs = extractor(imgs, pts, metas, return_4d=False)
+            feats_for_head = vecs
 
         if not printed_shapes:
             if head_type == "vit":
@@ -752,27 +638,20 @@ def train_one_epoch(extractor: nn.Module, head: nn.Module, loader: DataLoader, d
         if head_type == "vit":
             img_feat, mask, img_pe = feats_for_head
             logits = head(img_feat, mask, img_pe)
+            if (not printed_tokens) and hasattr(head, "last_token_count"):
+                print(f"[TOKENS][E{epoch}] ViT tokens = {head.last_token_count} (per sample, excl. [CLS])")
+                logger.write(f"epoch={epoch} tokens={head.last_token_count}")
+                printed_tokens = True
         else:
             logits = head(feats_for_head)
 
         logits = _apply_logit_adjust(logits, log_prior, logit_adjust_tau)
         loss = loss_fn(logits, y)
-        # （可选）每个 epoch 打印一次 token 保留统计
-        if hasattr(head, "pop_last_stats"):
-            st = head.pop_last_stats()
-            if st is not None and not printed_shapes:  # 跟随 printed_shapes 的门闩，每 epoch 只打一条
-                logger.write(f"epoch={epoch} keep_stats Nraw={st['N_raw']} Ncap={st['N_cap']} "
-                            f"kept_avg={st['kept_avg']} keep_ratio={st['keep_ratio']:.4f} "
-                            f"topk_hits={st['topk_hits']}/{y.size(0)}")
-                print(f"[KEEP][E{epoch}] Nraw={st['N_raw']} Ncap={st['N_cap']} "
-                    f"kept≈{st['kept_avg']} ({st['keep_ratio']:.2%}) "
-                    f"TopK batches={st['topk_hits']}/{y.size(0)}")
-
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if max_grad_norm and max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(head.parameters(), max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(list(extractor.parameters()) + list(head.parameters()), max_grad_norm)
         optimizer.step()
 
         bs = y.size(0)
@@ -790,10 +669,12 @@ def evaluate(extractor: nn.Module, head: nn.Module, loader: DataLoader, device: 
              log_prior: Optional[torch.Tensor] = None, logit_adjust_tau: float = 0.0, head_type: str = "vit",
              save_dir: Optional[Path] = None):
     torch.cuda.empty_cache()
+    extractor.eval()
     head.eval()
     total_loss, n = 0.0, 0
     correct = 0
     printed_shapes = False
+    printed_tokens = False
 
     cm = None
     if n_classes is not None:
@@ -812,6 +693,10 @@ def evaluate(extractor: nn.Module, head: nn.Module, loader: DataLoader, device: 
                 logger.write(f"epoch={epoch} [shapes/{split_name}] x=[{B},{C},{H},{W}] -> logits=[{y.size(0)},{head.fc.out_features}]")
                 printed_shapes = True
             logits = head(img_feat, mask, img_pe)
+            if (not printed_tokens) and hasattr(head, "last_token_count"):
+                print(f"[TOKENS][E{epoch}][{split_name}] ViT tokens = {head.last_token_count} (per sample, excl. [CLS])")
+                logger.write(f"epoch={epoch} {split_name}_tokens={head.last_token_count}")
+                printed_tokens = True
         else:
             vecs = extractor(imgs, pts, metas, return_4d=False)
             if not printed_shapes:
@@ -824,19 +709,6 @@ def evaluate(extractor: nn.Module, head: nn.Module, loader: DataLoader, device: 
 
         logits = _apply_logit_adjust(logits, log_prior, logit_adjust_tau)
         loss = loss_fn(logits, y)
-        # （可选）每个 epoch 打印一次 token 保留统计
-        if hasattr(head, "pop_last_stats"):
-            st = head.pop_last_stats()
-            if st is not None and not printed_shapes:  # 跟随 printed_shapes 的门闩，每 epoch 只打一条
-                logger.write(f"epoch={epoch} keep_stats Nraw={st['N_raw']} Ncap={st['N_cap']} "
-                            f"kept_avg={st['kept_avg']} keep_ratio={st['keep_ratio']:.4f} "
-                            f"topk_hits={st['topk_hits']}/{y.size(0)}")
-                print(f"[KEEP][E{epoch}] Nraw={st['N_raw']} Ncap={st['N_cap']} "
-                    f"kept≈{st['kept_avg']} ({st['keep_ratio']:.2%}) "
-                    f"TopK batches={st['topk_hits']}/{y.size(0)}")
-
-
-
         bs = y.size(0)
         total_loss += loss.item() * bs
         n += bs
@@ -856,12 +728,14 @@ def evaluate(extractor: nn.Module, head: nn.Module, loader: DataLoader, device: 
     logger.write(f"epoch={epoch} {split_name}_loss={avg_loss:.6f} {split_name}_acc={acc:.6f}")
     print(f"[{split_name.upper()}] epoch {epoch}  loss={avg_loss:.4f}  acc={acc:.4f}")
 
-    # ---- per-class metrics + 混淆矩阵图 ----
+    # 简单保存混淆矩阵图（可选） + per-class 指标
     if (cm is not None) and (id2name is not None):
         cm_np = cm.numpy()
+
+        # per-class metrics
         tp = np.diag(cm_np)
-        gt_per_cls = cm_np.sum(axis=1)    # 行
-        pred_per_cls = cm_np.sum(axis=0)  # 列
+        gt_per_cls = cm_np.sum(axis=1)
+        pred_per_cls = cm_np.sum(axis=0)
         eps = 1e-12
         recall = np.divide(tp, gt_per_cls + eps)
         precision = np.divide(tp, pred_per_cls + eps)
@@ -873,28 +747,116 @@ def evaluate(extractor: nn.Module, head: nn.Module, loader: DataLoader, device: 
             print(f"  {c:2d} {name:>16s}: P={precision[c]:.4f} R={recall[c]:.4f} F1={f1[c]:.4f} (GT={int(gt_per_cls[c])}, Pred={int(pred_per_cls[c])})")
             logger.write(f"epoch={epoch} {split_name}_percls[{c}][{name}] P={precision[c]:.6f} R={recall[c]:.6f} F1={f1[c]:.6f} GT={int(gt_per_cls[c])} Pred={int(pred_per_cls[c])}")
 
-        valid_gt = gt_per_cls > 0
-        valid_pred = pred_per_cls > 0
-        macro_recall = float(recall[valid_gt].mean()) if valid_gt.any() else float("nan")
-        macro_precision = float(precision[valid_pred].mean()) if valid_pred.any() else float("nan")
-        macro_f1 = 0.0 if (macro_precision + macro_recall) < eps else 2*macro_precision*macro_recall/(macro_precision+macro_recall)
-        print(f"[{split_name.upper()} macro] (epoch {epoch}): P={macro_precision:.4f} R={macro_recall:.4f} F1={macro_f1:.4f}")
-        logger.write(f"epoch={epoch} {split_name}_macro P={macro_precision:.6f} R={macro_recall:.6f} F1={macro_f1:.6f}")
+        save_base = (save_dir if save_dir is not None else SMALLFILE_ROOT)
+        ensure_dir(save_base)
+        save_png = Path(save_base) / f"cm_{split_name}_epoch{epoch:03d}.png"
+        _save_confmat_figure(cm_np, id2name, save_png, title=f"Confusion Matrix [{split_name}] epoch {epoch}")
+        print(f"[{split_name.upper()}] confusion matrix saved to: {save_png}")
 
-        save_path = SMALLFILE_ROOT / f"cm_{split_name}_epoch{epoch:03d}.png"
-        _save_confmat_figure(cm_np, id2name, save_path, title=f"Confusion Matrix [{split_name}] epoch {epoch}")
-        print(f"[{split_name.upper()}] confusion matrix saved to: {save_path}")
-
-        # 额外：在 test 模式下可选另存到指定目录，并保存 CSV
-        if save_dir is not None:
-            ensure_dir(save_dir)
-            _save_confmat_figure(cm_np, id2name, save_dir / "confusion_matrix.png", title=f"Confusion Matrix [{split_name}]")
-            pd.DataFrame(cm_np,
-                         columns=[id2name.get(i,str(i)) for i in range(cm_np.shape[0])],
-                         index=[id2name.get(i,str(i)) for i in range(cm_np.shape[0])]
-                        ).to_csv(save_dir / "confusion_matrix.csv", index=True)
+        # 也保存原始 cm 到 csv
+        save_csv = Path(save_base) / f"cm_{split_name}_epoch{epoch:03d}.csv"
+        pd.DataFrame(cm_np, index=[id2name.get(i, str(i)) for i in range(cm_np.shape[0])],
+                           columns=[id2name.get(i, str(i)) for i in range(cm_np.shape[1])]).to_csv(save_csv)
+        print(f"[{split_name.upper()}] confusion matrix CSV saved to: {save_csv}")
 
     return avg_loss, acc
+
+@torch.no_grad()
+def evaluate_and_dump(extractor: nn.Module,
+                      head: nn.Module,
+                      loader: DataLoader,
+                      device: str,
+                      n_classes: int,
+                      id2name: Dict[int, str],
+                      save_dir: Path,
+                      log_prior: Optional[torch.Tensor] = None,
+                      logit_adjust_tau: float = 0.0,
+                      head_type: str = "vit"):
+    """
+    评测并将结果落盘：
+      - confusion_matrix.png / confusion_matrix.csv
+      - predictions.csv （逐样本）
+      - summary.txt （总体与分类别指标）
+    """
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    all_targets, all_preds, all_probs, img_paths = [], [], [], []
+
+    extractor.eval()
+    head.eval()
+    pbar = tqdm(loader, total=len(loader), ncols=100, desc="TEST", leave=False)
+    for batch in pbar:
+        imgs, pts, metas = batch["images"], batch["points"], batch["meta"]
+        y = batch["targets"].to(device)
+
+        if head_type == "vit":
+            img_feat, mask, img_pe = extractor(imgs, pts, metas, return_4d=True)
+            logits = head(img_feat, mask, img_pe)
+        else:
+            vecs = extractor(imgs, pts, metas, return_4d=False)
+            logits = head(vecs)
+
+        logits = _apply_logit_adjust(logits, log_prior, logit_adjust_tau)
+        prob = torch.softmax(logits, dim=1)
+        pred = prob.argmax(dim=1)
+
+        all_targets.append(y.cpu())
+        all_preds.append(pred.cpu())
+        all_probs.append(prob.cpu())
+        img_paths.extend([m.get("image_path", "") for m in metas])
+
+    y_true = torch.cat(all_targets).numpy()
+    y_pred = torch.cat(all_preds).numpy()
+    prob   = torch.cat(all_probs).numpy()
+
+    # 混淆矩阵（整数计数）
+    cm = np.zeros((n_classes, n_classes), dtype=np.int64)
+    for t, p in zip(y_true, y_pred):
+        cm[int(t), int(p)] += 1
+
+    # 保存图像版混淆矩阵
+    _save_confmat_figure(cm, id2name, save_dir / "confusion_matrix.png", title="Confusion Matrix [test]")
+
+    # 保存 CSV 版混淆矩阵
+    pd.DataFrame(
+        cm,
+        index=[id2name.get(i, str(i)) for i in range(n_classes)],
+        columns=[id2name.get(i, str(i)) for i in range(n_classes)]
+    ).to_csv(save_dir / "confusion_matrix.csv")
+
+    # 逐样本预测
+    top1_prob = prob[np.arange(len(prob)), y_pred]
+    pd.DataFrame({
+        "image_path": img_paths,
+        "true_id": y_true,
+        "true_name": [id2name.get(int(t), str(int(t))) for t in y_true],
+        "pred_id": y_pred,
+        "pred_name": [id2name.get(int(p), str(int(p))) for p in y_pred],
+        "pred_conf": top1_prob
+    }).to_csv(save_dir / "predictions.csv", index=False)
+
+    # 分类别指标 + 总体
+    tp = np.diag(cm).astype(float)
+    gt_per_cls = cm.sum(axis=1).astype(float)
+    pred_per_cls = cm.sum(axis=0).astype(float)
+    eps = 1e-12
+    recall = np.divide(tp, gt_per_cls + eps)
+    precision = np.divide(tp, pred_per_cls + eps)
+    f1 = np.where((precision + recall) < eps, 0.0, 2 * precision * recall / (precision + recall))
+    overall_acc = (y_true == y_pred).mean()
+
+    with open(save_dir / "summary.txt", "w") as f:
+        f.write(f"overall_acc={overall_acc:.6f}\n")
+        for cid in range(n_classes):
+            name = id2name.get(cid, f"class{cid}")
+            f.write(
+                f"cls[{cid}][{name}] P={precision[cid]:.6f} R={recall[cid]:.6f} "
+                f"F1={f1[cid]:.6f} GT={int(gt_per_cls[cid])} Pred={int(pred_per_cls[cid])}\n"
+            )
+
+    print(f"[TEST] overall_acc={overall_acc:.4f} | results saved to: {save_dir}")
+    return overall_acc, cm
+
 
 # ---------- Main ----------
 def _parse_hidden_list(s: str) -> List[int]:
@@ -907,24 +869,25 @@ def main():
     ap.add_argument("--label-map", type=str, default=None)
     ap.add_argument("--backend", choices=["official"], default="official")
 
-    # 默认用 tiny；脚本会自动探测 C,H,W
+    # 默认 sam2 tiny
     ap.add_argument("--sam2-cfg",  type=str, default=str(PRETRAIN_ROOT / "sam2_hiera_t.yaml"))
     ap.add_argument("--sam2-ckpt", type=str, default=str(PRETRAIN_ROOT / "sam2_hiera_tiny.pt"))
 
     ap.add_argument("--epochs", type=int, default=20)
-    ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--split", type=float, default=0.8)
     ap.add_argument("--hidden", type=str, default="0")
     ap.add_argument("--drop", type=float, default=0.0)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--backbone-lr", type=float, default=1e-4, help="lr for SAM2 backbone")
     ap.add_argument("--weight-decay", type=float, default=0.05)
     ap.add_argument("--patience", type=int, default=5)
     ap.add_argument("--resize", type=int, default=None)
     ap.add_argument("--out-dir", type=str, default=str(CKPT_ROOT))
 
-    ap.add_argument("--head", choices=["linear","mlp","mlp_bn","cosine","vit"], default="vit")
+    ap.add_argument("--head", choices=["linear","cosine","vit"], default="vit")
     ap.add_argument("--scale", type=float, default=16.0)
     ap.add_argument("--smoothing", type=float, default=0.0)
     ap.add_argument("--sched", choices=["none","cosine"], default="cosine")
@@ -932,47 +895,44 @@ def main():
     ap.add_argument("--max-grad-norm", type=float, default=0.0)
     ap.add_argument("--resume", type=str, default=None)
 
-    # ViT 轻量头参数（修正参数名）
+    # ViT 头
     ap.add_argument("--vit-layers", type=int, default=2)
     ap.add_argument("--vit-heads",  type=int, default=4)
     ap.add_argument("--vit-drop",   type=float, default=0.05)
     ap.add_argument("--vit-mlp-ratio", type=float, default=4.0)
-    ap.add_argument("--vit-max-tokens", type=int, default=1024, help="cap tokens per sample before Transformer")
-    ap.add_argument("--vit-min-keep",  type=int, default=256,  help="per-sample minimum foreground tokens kept")
+    ap.add_argument("--vit-max-tokens", type=int, default=1024)
+    ap.add_argument("--vit-min-keep",  type=int, default=256)
 
-    # balancing / focal / logit-adjust
+    # class balance
     ap.add_argument("--balance", choices=["none","weights","sampler","auto"], default="auto")
     ap.add_argument("--focal", action="store_true")
     ap.add_argument("--reweight-alpha", type=float, default=1.0)
     ap.add_argument("--bg-factor", type=float, default=0.1)
     ap.add_argument("--logit-adjust", type=float, default=1.0)
 
-    # 背景掩码策略
-    ap.add_argument("--bg-mask-mode", choices=["pos","global","mix"], default="mix")
-    ap.add_argument("--vit-mask-thr", type=float, default=0.3, help="mask threshold for foreground tokens")
-    ap.add_argument("--vit-debug", action="store_true", help="log token keep stats per epoch")
+    # eval/test batch size
+    ap.add_argument("--val-batch-size", type=int, default=None)
+    ap.add_argument("--test-batch-size", type=int, default=None)
 
-
-    # eval/test 独立 batch size
-    ap.add_argument("--val-batch-size", type=int, default=None, help="eval/val loader bs; default=--batch-size")
-    ap.add_argument("--test-batch-size", type=int, default=None, help="test loader bs; default=--batch-size")
-
-    # ===== 新增：测试模式与数据集切换 =====
-    ap.add_argument("--mode", choices=["train", "test"], default="train",
-                    help="train: 原训练流程; test: 加载已训练 head 在选择的数据集上评测")
-    ap.add_argument("--dataset", choices=["combined","cholec80"], default="combined",
-                    help="combined: 使用 config/test_manifest_10.csv; cholec80: 使用 5 类 OOD 清单")
+    # ===================== 新增：测试模式与数据集切换 =====================
+    ap.add_argument("--test-only", action="store_true",
+                    help="等价于 --mode test")
+    ap.add_argument("--test-dataset", choices=["combined","cholec80"], default=None,
+                    help="优先于 --dataset；未提供时沿用 --dataset")
+    ap.add_argument("--cholec80-root", type=str, default=None,
+                    help="若提供，将在该目录下寻找 manifest.csv / label_map.json")
     ap.add_argument("--combined-manifest", type=str,
                     default=str(SMALLFILE_ROOT / "test_manifest_10.csv"))
     ap.add_argument("--combined-labelmap", type=str,
                     default=str(SMALLFILE_ROOT / "label_map.json"))
-    ap.add_argument("--cholec80-manifest", type=str,
-                    default="/projects/surgical-video-digital-twin/Wenzheng/IPCAI/cholec80_test41-80/manifest.csv")
-    ap.add_argument("--cholec80-labelmap", type=str,
-                    default="/projects/surgical-video-digital-twin/Wenzheng/IPCAI/cholec80_test41-80/label_map.json")
-    ap.add_argument("--save-root", type=str,
-                    default=str(CKPT_ROOT / "eval_vit"),
-                    help="root folder to save test results (cm image/csv, logs)")
+    # 在 argparse 定义处（和 --test-only 等放一起）
+    ap.add_argument(
+        "--save-root",
+        type=str,
+        default=str(CKPT_ROOT / "eval_vit_e2e"),
+        help="测试结果输出目录（将写入 confusion_matrix.(png|csv), predictions.csv, summary.txt）",
+    )
+    # ====================================================================
 
     args = ap.parse_args()
     if args.resize is not None:
@@ -987,19 +947,108 @@ def main():
     manifest_path = Path(args.manifest) if args.manifest else (data_root / "manifest.csv")
     label_map_path = Path(args.label_map) if args.label_map else (data_root / "label_map.json")
     out_dir = Path(args.out_dir) if args.out_dir else CKPT_ROOT
-    if args.head == "vit": out_dir = out_dir / "vit_head"
+    if args.head == "vit": out_dir = out_dir / "vit_head_e2e"
     ensure_dir(out_dir); ensure_dir(SMALLFILE_ROOT)
 
-    # 使用现成 split（按你的环境）
+    # ===================== TEST 分支（不改训练流程） =====================
+    if args.test_only or args.mode == "test":
+        # 1) 解析数据集与路径
+        test_dataset = args.test_dataset if args.test_dataset is not None else args.dataset
+        if test_dataset == "combined":
+            test_manifest_path = Path(args.combined_manifest)
+            test_labelmap_path = Path(args.combined_labelmap)
+        else:  # cholec80
+            if args.cholec80_root is not None:
+                root = Path(args.cholec80_root)
+                test_manifest_path = root / "manifest.csv"
+                test_labelmap_path = root / "label_map.json"
+            else:
+                test_manifest_path = Path(args.cholec80_manifest)
+                test_labelmap_path = Path(args.cholec80_labelmap)
+
+        if not test_manifest_path.exists():
+            raise FileNotFoundError(f"Test manifest not found: {test_manifest_path}")
+        if not test_labelmap_path.exists():
+            raise FileNotFoundError(f"Test label_map not found: {test_labelmap_path}")
+
+        # 2) label map / 类别映射
+        lm_eval = load_label_map(test_labelmap_path)
+        tool2id_eval = lm_eval["tool_to_id"]
+        assert "background" in tool2id_eval and tool2id_eval["background"] == 0
+        id2name_eval = {int(v): str(k) for k, v in tool2id_eval.items()}
+
+        # 3) dataloader
+        ds_eval = FramePointDataset(test_manifest_path, test_labelmap_path, resize=args.resize, bg_mask_mode="mix")
+        if len(ds_eval) == 0:
+            raise RuntimeError("Empty test set after filtering. Check test manifest/points_json.")
+        dl_eval = DataLoader(ds_eval,
+                             batch_size=(args.test_batch_size or args.batch_size),
+                             shuffle=False, num_workers=args.workers,
+                             collate_fn=collate_varlen, pin_memory=True)
+
+        # 4) 构建模型 + 还原权重（E2E：SAM2 + ViT 头）
+        if args.backend != "official":
+            raise NotImplementedError("Only 'official' backend is provided.")
+        extractor = Sam2OfficialWrapper(args.sam2_cfg, args.sam2_ckpt, device=device, cache_size=128)
+
+        if args.resume is None or (not Path(args.resume).exists()):
+            raise FileNotFoundError("--resume checkpoint missing for test mode")
+        ckpt = torch.load(args.resume, map_location="cpu")
+        in_dim = int(ckpt.get("in_dim", 0))
+        n_classes = int(ckpt.get("n_classes", len(tool2id_eval)))
+
+        if in_dim <= 0:
+            probe = next(iter(dl_eval))
+            with torch.no_grad():
+                img_feat_probe, _, _ = extractor(probe["images"][:1], probe["points"][:1], probe["meta"][:1], return_4d=True)
+                in_dim = int(img_feat_probe.shape[1])
+
+        head = ViTTokenHead(in_dim=in_dim, n_classes=n_classes,
+                            num_layers=args.vit_layers, num_heads=args.vit_heads,
+                            mlp_ratio=args.vit_mlp_ratio, p_drop=args.vit_drop,
+                            max_tokens=args.vit_max_tokens, min_keep_tokens=args.vit_min_keep).to(device)
+
+        # 恢复权重
+        hs = ckpt.get("head_state", None)
+        if hs is not None:
+            try:
+                head.load_state_dict(hs, strict=True)
+            except Exception:
+                head.load_state_dict(hs, strict=False)
+        ss = ckpt.get("sam2_state", None)
+        if ss is not None:
+            try:
+                extractor.model.load_state_dict(ss, strict=True)
+            except Exception:
+                extractor.model.load_state_dict(ss, strict=False)
+
+        # 5) 保存目录（保持稳定路径，便于自动化收集）
+        save_dir = Path(args.save_root) / test_dataset / "unfreeze_sam2_VIT"
+        ensure_dir(save_dir)
+
+        print(f"Dataset: {test_dataset} ({test_manifest_path})")
+        print(f"Model: SAM2({Path(args.sam2_cfg).name}) + ViT head | checkpoint={args.resume}")
+        print(f"Save to: {save_dir}")
+
+        # 6) 评测并落盘（与 distill 版统一导出）
+        #   先验通常不以 test 分布为准，默认关闭；若要开启可改为 torch.log(torch.tensor(priors+1e-12))
+        _ = evaluate_and_dump(
+            extractor, head, dl_eval, device,
+            n_classes=n_classes, id2name=id2name_eval,
+            save_dir=save_dir,
+            log_prior=None, logit_adjust_tau=args.logit_adjust,
+            head_type="vit"
+        )
+        return
+
+    # ===================== TEST 分支结束 =====================
+
+    # 使用现成 split
     train_csv = SMALLFILE_ROOT / "train_manifest_10.csv"
     val_csv   = SMALLFILE_ROOT / "val_manifest_10.csv"
     test_csv  = SMALLFILE_ROOT / "test_manifest_10.csv"
-    if train_csv.exists() and val_csv.exists():
-        df_train = pd.read_csv(train_csv)
-        df_val   = pd.read_csv(val_csv)
-        df_test  = pd.read_csv(test_csv) if test_csv.exists() else pd.DataFrame(columns=df_train.columns)
-    else:
-        raise FileNotFoundError("train/val manifest not found")
+    if not (train_csv.exists() and val_csv.exists()):
+        raise FileNotFoundError("train/val manifest not found under SMALLFILE_ROOT")
 
     # label_map check
     lm = load_label_map(label_map_path)
@@ -1007,103 +1056,10 @@ def main():
     assert "background" in tool2id and tool2id["background"] == 0
     id2name = {int(v): str(k) for k, v in tool2id.items()}
 
-    # model
-    if args.backend != "official":
-        raise NotImplementedError("Only 'official' backend is provided.")
-    extractor = Sam2OfficialWrapper(args.sam2_cfg, args.sam2_ckpt, device=device, cache_size=128)
-
-    # ===== test 模式：仅构建测试集并评测，完全复用 evaluation 打印 =====
-    if args.mode == "test":
-        if args.dataset == "combined":
-            test_manifest_path = Path(args.combined_manifest)
-            test_labelmap_path = Path(args.combined_labelmap)
-        else:
-            test_manifest_path = Path(args.cholec80_manifest)
-            test_labelmap_path = Path(args.cholec80_labelmap)
-        if not test_manifest_path.exists():
-            raise FileNotFoundError(f"Test manifest not found: {test_manifest_path}")
-        if not test_labelmap_path.exists():
-            raise FileNotFoundError(f"Test label_map not found: {test_labelmap_path}")
-
-        # 若测试集使用不同的 label_map，则重载 id2name / n_classes
-        lm_test = load_label_map(test_labelmap_path)
-        tool2id_test = lm_test["tool_to_id"]
-        id2name_test = {int(v): str(k) for k, v in tool2id_test.items()}
-        n_classes_test = len(tool2id_test)
-
-        ds_eval = FramePointDataset(test_manifest_path, test_labelmap_path,
-                                    resize=args.resize, bg_mask_mode=args.bg_mask_mode)
-        if len(ds_eval) == 0:
-            raise RuntimeError("Empty test set after filtering. Check test manifest/points_json.")
-        test_bs  = args.test_batch_size if args.test_batch_size is not None else args.batch_size
-        dl_eval = DataLoader(ds_eval, batch_size=test_bs, shuffle=False,
-                             num_workers=args.workers, collate_fn=collate_varlen, pin_memory=True)
-
-        # 探测输入维度
-        probe = next(iter(dl_eval))
-        with torch.no_grad():
-            if args.head == "vit":
-                img_feat_probe, mask_probe, img_pe_probe = extractor(probe["images"][:1], probe["points"][:1], probe["meta"][:1], return_4d=True)
-                in_dim = int(img_feat_probe.shape[1])
-            else:
-                vec = extractor(probe["images"][:1], probe["points"][:1], probe["meta"][:1], return_4d=False)
-                in_dim = int(vec.shape[-1])
-
-        # 构建头
-        hidden_list = _parse_hidden_list(args.hidden)
-        if args.head == "vit":
-            # 适配 token 上限
-            H1, W1 = int(img_feat_probe.shape[-2]), int(img_feat_probe.shape[-1])
-            N1 = H1 * W1
-            auto_max_tokens = max(args.vit_max_tokens, min(4096, int(1.25 * N1)))
-            head = ViTTokenHead(in_dim=in_dim, n_classes=n_classes_test,
-                                num_layers=args.vit_layers, num_heads=args.vit_heads,
-                                mlp_ratio=args.vit_mlp_ratio, p_drop=args.vit_drop,
-                                max_tokens=auto_max_tokens, min_keep_tokens=args.vit_min_keep,
-                                mask_thr=args.vit_mask_thr, debug=False).to(device)
-        elif args.head == "linear":
-            head = MLPHead(in_dim, n_classes_test, hidden=0, drop=args.drop).to(device)
-        elif args.head == "mlp":
-            h = hidden_list[0] if hidden_list else 0
-            head = MLPHead(in_dim, n_classes_test, hidden=h, drop=args.drop).to(device)
-        elif args.head == "mlp_bn":
-            if not hidden_list: hidden_list = [1024, 512]
-            head = MLPBNHead(in_dim, n_classes_test, hidden_layers=hidden_list, drop=args.drop).to(device)
-        else:
-            head = CosineClassifier(in_dim, n_classes_test, scale=args.scale).to(device)
-
-        # 加载已训练权重
-        if args.resume is None or not Path(args.resume).exists():
-            raise FileNotFoundError("--resume (trained head .pt) is required for test mode.")
-        ckpt = torch.load(args.resume, map_location="cpu")
-        state = ckpt.get("head_state", ckpt)
-        try:
-            head.load_state_dict(state, strict=True)
-        except Exception:
-            head.load_state_dict(state, strict=False)
-
-        # 保存目录 + 英文三条打印
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        model_sig = f"{Path(args.sam2_cfg).stem}_{Path(args.sam2_ckpt).stem}_{args.head}"
-        # save_dir = Path(args.save_root) / args.dataset / f"{model_sig}_{ts}"
-        save_dir = Path(args.save_root) / args.dataset / ("froze_sam2_VIT")
-        ensure_dir(save_dir)
-        print(f"Dataset : {args.dataset} ({test_manifest_path})")
-        print(f"Model   : SAM2({Path(args.sam2_cfg).name}, {Path(args.sam2_ckpt).name}) + Head({args.head}) from {args.resume}")
-        print(f"Save to : {save_dir}")
-
-        # 复用 evaluation 打印 + 额外把混淆矩阵保存到 save_dir
-        loss_fn = nn.CrossEntropyLoss(label_smoothing=args.smoothing)
-        _ = evaluate(extractor, head, dl_eval, device,
-                     epoch=0, logger=TrainingLogger(save_dir / "test_log.txt"), loss_fn=loss_fn,
-                     split_name="test", n_classes=n_classes_test, id2name=id2name_test,
-                     log_prior=None, logit_adjust_tau=0.0, head_type=args.head, save_dir=save_dir)
-        return
-
-    # ====== 训练流程（保持不变）======
-    ds_train = FramePointDataset(train_csv, label_map_path, resize=args.resize, bg_mask_mode=args.bg_mask_mode)
-    ds_val   = FramePointDataset(val_csv,   label_map_path, resize=args.resize, bg_mask_mode=args.bg_mask_mode) if len(df_val)  else None
-    ds_test  = FramePointDataset(test_csv,  label_map_path, resize=args.resize, bg_mask_mode=args.bg_mask_mode) if len(df_test) else None
+    # datasets & loaders
+    ds_train = FramePointDataset(train_csv, label_map_path, resize=args.resize, bg_mask_mode="mix")
+    ds_val   = FramePointDataset(val_csv,   label_map_path, resize=args.resize, bg_mask_mode="mix")
+    ds_test  = FramePointDataset(test_csv,  label_map_path, resize=args.resize, bg_mask_mode="mix") if test_csv.exists() else None
 
     train_bs = args.batch_size
     val_bs   = args.val_batch_size  if args.val_batch_size  is not None else args.batch_size
@@ -1112,16 +1068,18 @@ def main():
     dl_train = DataLoader(ds_train, batch_size=train_bs, shuffle=True,  num_workers=args.workers,
                           collate_fn=collate_varlen, pin_memory=True)
     dl_val   = DataLoader(ds_val,   batch_size=val_bs,   shuffle=False, num_workers=args.workers,
-                          collate_fn=collate_varlen, pin_memory=True) if ds_val else None
+                          collate_fn=collate_varlen, pin_memory=True)
     dl_test  = DataLoader(ds_test,  batch_size=test_bs,  shuffle=False, num_workers=args.workers,
                           collate_fn=collate_varlen, pin_memory=True) if ds_test else None
 
+    # class stats
     counts, train_dist, imb_ratio, priors = _class_stats(train_csv, label_map_path)
     if train_dist is not None:
         print(f"[CHECK] train distribution per class = {train_dist} | imbalance ratio={imb_ratio:.2f}")
     class_weights_ce = _ce_class_weights_from_counts(counts) if counts is not None else None
     log_prior = torch.log(torch.tensor(priors + 1e-12, dtype=torch.float32)) if priors is not None else None
 
+    # sampler（可选）
     sampler = None
     if (args.balance in ("auto","sampler")) and (counts is not None):
         use_sampler = (args.balance == "sampler") or (args.balance == "auto" and imb_ratio >= 5.0)
@@ -1135,47 +1093,45 @@ def main():
                                   collate_fn=collate_varlen, pin_memory=True, sampler=sampler)
             print(f"[INFO] Using WeightedRandomSampler (alpha={args.reweight_alpha}, bg_factor={args.bg_factor}).")
 
+    # model
+    if args.backend != "official":
+        raise NotImplementedError("Only 'official' backend is provided.")
+    extractor = Sam2OfficialWrapper(args.sam2_cfg, args.sam2_ckpt, device=device, cache_size=128)
+
+    # probe dims
     if len(ds_train) == 0:
         raise RuntimeError("Empty training set.")
     probe = next(iter(dl_train))
     with torch.no_grad():
-        if args.head == "vit":
-            img_feat_probe, mask_probe, img_pe_probe = extractor(probe["images"][:1], probe["points"][:1], probe["meta"][:1], return_4d=True)
-            C = int(img_feat_probe.shape[1]); in_dim = C
-            H1, W1 = int(img_feat_probe.shape[-2]), int(img_feat_probe.shape[-1])
-            N1 = H1 * W1
-            auto_max_tokens = max(args.vit_max_tokens, min(4096, int(1.25 * N1)))
-            print(f"[PROBE] img_feat={tuple(img_feat_probe.shape)} mask={tuple(mask_probe.shape)} pos={'None' if img_pe_probe is None else tuple(img_pe_probe.shape)}")
-            print(f"[VIT] auto_max_tokens={auto_max_tokens} (from N={N1})")
-        else:
-            vec = extractor(probe["images"][:1], probe["points"][:1], probe["meta"][:1], return_4d=False)
-            in_dim = int(vec.shape[-1])
-            print(f"[PROBE] pooled_vec={tuple(vec.shape)}")
-            auto_max_tokens = None
+        img_feat_probe, mask_probe, img_pe_probe = extractor(probe["images"][:1], probe["points"][:1], probe["meta"][:1], return_4d=True)
+        C = int(img_feat_probe.shape[1]); in_dim = C
+        H1, W1 = int(img_feat_probe.shape[-2]), int(img_feat_probe.shape[-1])
+        N1 = H1 * W1
+        auto_max_tokens = max(args.vit_max_tokens, min(4096, int(1.25 * N1)))
+        print(f"[PROBE] img_feat={tuple(img_feat_probe.shape)} mask={tuple(mask_probe.shape)} pos={'None' if img_pe_probe is None else tuple(img_pe_probe.shape)}")
+        print(f"[VIT] auto_max_tokens={auto_max_tokens} (from N={N1})")
+
     n_classes = len(tool2id)
 
-    hidden_list = _parse_hidden_list(args.hidden)
+    # build head
     if args.head == "vit":
         head = ViTTokenHead(in_dim=in_dim, n_classes=n_classes,
-                    num_layers=args.vit_layers, num_heads=args.vit_heads,
-                    mlp_ratio=args.vit_mlpp_ratio if hasattr(args, "vit_mlpp_ratio") else args.vit_mlp_ratio,
-                    p_drop=args.vit_drop,
-                    max_tokens=auto_max_tokens, min_keep_tokens=args.vit_min_keep,
-                    mask_thr=args.vit_mask_thr, debug=args.vit_debug).to(device)
-
+                            num_layers=args.vit_layers, num_heads=args.vit_heads,
+                            mlp_ratio=args.vit_mlp_ratio, p_drop=args.vit_drop,
+                            max_tokens=auto_max_tokens, min_keep_tokens=args.vit_min_keep).to(device)
         print(f"[VIT] max_tokens={auto_max_tokens}  min_keep_tokens={args.vit_min_keep}")
     elif args.head == "linear":
         head = MLPHead(in_dim, n_classes, hidden=0, drop=args.drop).to(device)
-    elif args.head == "mlp":
-        h = hidden_list[0] if hidden_list else 0
-        head = MLPHead(in_dim, n_classes, hidden=h, drop=args.drop).to(device)
-    elif args.head == "mlp_bn":
-        if not hidden_list: hidden_list = [1024, 512]
-        head = MLPBNHead(in_dim, n_classes, hidden_layers=hidden_list, drop=args.drop).to(device)
     else:
         head = CosineClassifier(in_dim, n_classes, scale=args.scale).to(device)
 
-    opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # optimizer / scheduler / loss（两组参数：backbone + head）
+    opt = torch.optim.AdamW(
+        [
+            {"params": extractor.parameters(), "lr": args.backbone_lr, "weight_decay": args.weight_decay},
+            {"params": head.parameters(),      "lr": args.lr,          "weight_decay": args.weight_decay},
+        ]
+    )
 
     using_sampler = sampler is not None
     if args.focal:
@@ -1197,57 +1153,72 @@ def main():
 
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=args.lr*0.01) if args.sched=="cosine" else None
 
+    # resume（同时恢复 SAM2 和 head）
     if args.resume is not None and Path(args.resume).exists():
         ckpt = torch.load(args.resume, map_location="cpu")
-        state = ckpt.get("head_state", ckpt)
-        try:
-            head.load_state_dict(state, strict=True)
-            print(f"[RESUME] Loaded head from {args.resume}")
-        except Exception as e:
-            print(f"[RESUME] Strict load failed: {e}\nTrying non-strict...")
-            head.load_state_dict(state, strict=False)
-            print(f"[RESUME] Non-strict loaded from {args.resume}")
+        hs = ckpt.get("head_state", None)
+        if hs is not None:
+            try:
+                head.load_state_dict(hs, strict=True)
+                print(f"[RESUME] Loaded head from {args.resume}")
+            except Exception as e:
+                print(f"[RESUME] Head strict load failed: {e}\nTrying non-strict...")
+                head.load_state_dict(hs, strict=False)
+        ss = ckpt.get("sam2_state", None)
+        if ss is not None:
+            try:
+                extractor.model.load_state_dict(ss, strict=True)
+                print(f"[RESUME] Loaded SAM2 from {args.resume}")
+            except Exception as e:
+                print(f"[RESUME] SAM2 strict load failed: {e}\nTrying non-strict...")
+                extractor.model.load_state_dict(ss, strict=False)
 
-    log_file = SMALLFILE_ROOT / ("train_log_vit.txt" if args.head == "vit" else "train_log.txt")
+    # logger
+    log_file = SMALLFILE_ROOT / "train_log_vit_e2e.txt"
     logger = TrainingLogger(log_file)
 
     try:
         best_acc = -1.0; best_epoch = -1
         patience_left = args.patience
-        best_path = out_dir / "best_head.pt"
+        best_path = out_dir / "best_e2e.pt"
+        best_sam2_path = out_dir / "best_sam2.pt"
 
         for epoch in range(1, args.epochs + 1):
             if args.warmup_epochs and epoch <= args.warmup_epochs:
                 warmup_ratio = epoch / max(1, args.warmup_epochs)
                 for pg in opt.param_groups:
-                    pg["lr"] = args.lr * (0.1 + 0.9 * warmup_ratio)
+                    base_lr = args.backbone_lr if pg["params"] and next(iter(pg["params"])).requires_grad and pg is opt.param_groups[0] else args.lr
+                    pg["lr"] = base_lr * (0.1 + 0.9 * warmup_ratio)
 
             tr_loss = train_one_epoch(extractor, head, dl_train, device, opt, epoch, logger,
                                       loss_fn=loss_fn, max_grad_norm=args.max_grad_norm,
-                                      log_prior=log_prior, logit_adjust_tau=args.logit_adjust,
-                                      head_type=args.head)
+                                      log_prior=torch.log(torch.tensor(priors + 1e-12, dtype=torch.float32)).to(device) if args.logit_adjust>0 and priors is not None else None,
+                                      logit_adjust_tau=args.logit_adjust, head_type=args.head)
             va_loss, va_acc = evaluate(extractor, head, dl_val, device, epoch, logger,
                                        loss_fn=loss_fn, split_name="val",
-                                       n_classes=n_classes, id2name=id2name,
-                                       log_prior=log_prior, logit_adjust_tau=args.logit_adjust,
-                                       head_type=args.head)
+                                       n_classes=len(tool2id), id2name={int(v):k for k,v in tool2id.items()},
+                                       log_prior=torch.log(torch.tensor(priors + 1e-12, dtype=torch.float32)).to(device) if args.logit_adjust>0 and priors is not None else None,
+                                       logit_adjust_tau=args.logit_adjust, head_type=args.head)
+
             print(f"[{epoch:02d}] train_loss {tr_loss:.4f} | val_loss {va_loss:.4f} val_acc {va_acc:.3f}")
             if sched is not None and (not args.warmup_epochs or epoch > args.warmup_epochs): sched.step()
 
             improved = (va_acc > best_acc)
             if improved:
                 best_acc = va_acc; best_epoch = epoch; patience_left = args.patience
-                torch.save({"head_state": head.state_dict(),"in_dim": in_dim,"n_classes": n_classes,
-                            "tool_to_id": tool2id,"args": vars(args)}, str(best_path))
-                logger.write(f"epoch={epoch} SAVED best_head -> {best_path}")
+                payload = {
+                    "sam2_state": extractor.model.state_dict(),
+                    "head_state": head.state_dict(),
+                    "in_dim": in_dim,
+                    "n_classes": len(tool2id),
+                    "tool_to_id": tool2id,
+                    "args": vars(args),
+                }
+                torch.save(payload, str(best_path))
+                torch.save({"sam2_state": extractor.model.state_dict(), "args": vars(args)}, str(best_sam2_path))
+                logger.write(f"epoch={epoch} SAVED best -> {best_path} | sam2 -> {best_sam2_path}")
             else:
                 patience_left -= 1
-
-            if (epoch % 5 == 0) or (epoch == args.epochs):
-                ep_path = out_dir / f"head_epoch{epoch:03d}.pt"
-                torch.save({"head_state": head.state_dict(),"in_dim": in_dim,"n_classes": n_classes,
-                            "tool_to_id": tool2id,"args": vars(args)}, str(ep_path))
-                logger.write(f"epoch={epoch} SAVED periodic_head -> {ep_path}")
 
             if patience_left <= 0:
                 print(f"Early stopping at epoch {epoch}. Best val acc={best_acc:.4f} (epoch {best_epoch}).")
@@ -1257,9 +1228,9 @@ def main():
         if dl_test:
             test_loss, test_acc = evaluate(extractor, head, dl_test, device, epoch=best_epoch, logger=logger,
                                            loss_fn=loss_fn, split_name="test",
-                                           n_classes=n_classes, id2name=id2name,
-                                           log_prior=log_prior, logit_adjust_tau=args.logit_adjust,
-                                           head_type=args.head)
+                                           n_classes=len(tool2id), id2name={int(v):k for k,v in tool2id.items()},
+                                           log_prior=torch.log(torch.tensor(priors + 1e-12, dtype=torch.float32)).to(device) if args.logit_adjust>0 and priors is not None else None,
+                                           logit_adjust_tau=args.logit_adjust, head_type=args.head)
             print(f"[TEST] loss {test_loss:.4f} acc {test_acc:.3f}")
             logger.write(f"test_loss={test_loss:.6f} test_acc={test_acc:.6f}")
 
@@ -1271,86 +1242,30 @@ def main():
 if __name__ == "__main__":
     main()
 
-# Tiny Sam2
-# python /home/wcheng31/sam2_classify/train_sam2_classify_vit.py \
+
+# python /home/wcheng31/sam2_classify/train_sam2_classify_vit_finetune.py \
 #   --backend official \
-#   --epochs 20 --batch-size 256 --val-batch-size 64 \
+#   --epochs 20 --batch-size 16 --val-batch-size 64 \
 #   --seed 123 --patience 5 \
-#   --sam2-cfg sam2_hiera_t.yaml \
+#   --sam2-cfg  sam2_hiera_t.yaml \
 #   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_tiny.pt \
-#   --bg-mask-mode mix --logit-adjust 1.0 \
 #   --head vit --vit-layers 2 --vit-heads 4 --vit-drop 0.05 \
 #   --vit-max-tokens 1024 --vit-min-keep 256 \
-#   --balance sampler --focal --reweight-alpha 1.0 --bg-factor 0.1
-
-# Large sam2
-# python /home/wcheng31/sam2_classify/train_sam2_classify_vit.py \
-#   --backend official \
-#   --epochs 20 --batch-size 128 --val-batch-size 64 \
-#   --seed 123 --patience 5 \
-#   --sam2-cfg sam2_hiera_l.yaml \
-#   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_large.pt \
-#   --bg-mask-mode mix --logit-adjust 1.0 \
-#   --head vit --vit-layers 3 --vit-heads 8 --vit-drop 0.1 \
-#   --vit-max-tokens 2048 \
-#   --lr 8e-4 \
-#   --balance sampler --focal --reweight-alpha 1.0 --bg-factor 0.1
-
-# 建议先 weights 而非 sampler，先别开 focal
-# python /home/wcheng31/sam2_classify/train_sam2_classify_vit.py \
-#   --backend official \
-#   --epochs 20 --batch-size 128 --val-batch-size 64 \
-#   --seed 123 --patience 5 \
-#   --sam2-cfg sam2_hiera_l.yaml \
-#   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_large.pt \
-#   --head vit --vit-layers 3 --vit-heads 8 --vit-drop 0.1 \
-#   --vit-max-tokens 2048 --vit-min-keep 384 \
-#   --vit-mask-thr 0.35 --vit-debug \
-#   --balance weights --reweight-alpha 1.0 --bg-factor 0.4 \
+#   --lr 1e-3 --backbone-lr 1e-4 \
 #   --logit-adjust 1.0 \
-#   --lr 8e-4
+#   --balance sampler --focal --reweight-alpha 1.0 --bg-factor 0.1
 
 
-# Tiny + combined
-# python /home/wcheng31/sam2_classify/train_sam2_classify_vit.py \
-#   --mode test --dataset combined --backend official \
+
+# python /home/wcheng31/sam2_classify/train_sam2_classify_vit_finetune.py \
+#   --test-only \
+#   --test-dataset cholec80 \
+#   --cholec80-root /projects/surgical-video-digital-twin/Wenzheng/IPCAI/cholec80_test41-80 \
+#   --backend official \
 #   --sam2-cfg sam2_hiera_t.yaml \
 #   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_tiny.pt \
 #   --head vit --vit-layers 2 --vit-heads 4 --vit-drop 0.05 \
 #   --vit-max-tokens 1024 --vit-min-keep 256 \
-#   --bg-mask-mode mix --test-batch-size 64 \
-#   --resume /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/vit_head/best_head.pt \
-#   --save-root /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/eval_vit
-
-# Large + combined
-# python /home/wcheng31/sam2_classify/train_sam2_classify_vit.py \
-#   --mode test --dataset combined --backend official \
-#   --sam2-cfg sam2_hiera_l.yaml \
-#   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_large.pt \
-#   --head vit --vit-layers 3 --vit-heads 8 --vit-drop 0.1 \
-#   --vit-max-tokens 2048 --vit-min-keep 384 \
-#   --bg-mask-mode mix --test-batch-size 16 \
-#   --resume /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/vit_head/best_head.pt \
-#   --save-root /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/eval_vit
-
-# Tiny + cholec80
-# python /home/wcheng31/sam2_classify/train_sam2_classify_vit.py \
-#   --mode test --dataset cholec80 --backend official \
-#   --sam2-cfg sam2_hiera_t.yaml \
-#   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_tiny.pt \
-#   --head vit --vit-layers 2 --vit-heads 4 --vit-drop 0.05 \
-#   --vit-max-tokens 1024 --vit-min-keep 256 \
-#   --bg-mask-mode mix --test-batch-size 64 \
-#   --resume /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/vit_head/best_head.pt \
-#   --save-root /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/eval_vit
-
-# Large + cholec80
-# python /home/wcheng31/sam2_classify/train_sam2_classify_vit.py \
-#   --mode test --dataset cholec80 --backend official \
-#   --sam2-cfg sam2_hiera_l.yaml \
-#   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_large.pt \
-#   --head vit --vit-layers 3 --vit-heads 8 --vit-drop 0.1 \
-#   --vit-max-tokens 2048 --vit-min-keep 384 \
-#   --bg-mask-mode mix --test-batch-size 64 \
-#   --resume /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/vit_head/best_head.pt \
-#   --save-root /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/eval_vit
+#   --test-batch-size 64 \
+#   --resume /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/vit_head_e2e/best_e2e.pt \
+#   --save-root /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/eval_vit_e2e

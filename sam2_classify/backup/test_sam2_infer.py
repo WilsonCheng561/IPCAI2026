@@ -364,7 +364,7 @@ def main():
     ap.add_argument("--bg-mask-mode", choices=["pos","global","mix"], default="mix")
     ap.add_argument("--bg-mix-p", type=float, default=0.5)
 
-    ap.add_argument("--finetuned", type=str, default="",
+    ap.add_argument("--finetuned-ckpt", type=str, default="",
                 help="训练脚本导出的 best_full_finetune.pt；若提供则把其中 sam2_state 加载到 predictor")
 
 
@@ -428,8 +428,8 @@ def main():
         return
 
     predictor = _build_predictor(str(args.sam2_cfg), str(args.sam2_ckpt), device=device)
-    if args.finetuned:
-        load_finetuned_into_predictor(predictor, args.finetuned)
+    if args.finetuned-ckpt:
+        load_finetuned_into_predictor(predictor, args.finetuned_ckpt)
     print("SAM-2 predictor ready.\n")
 
     vis_dir = Path(args.out_dir) / ("vis_test_ood" if args.eval_set=="ood_raw" else "vis_test")
@@ -455,16 +455,7 @@ if __name__ == "__main__":
 #   --eval-set prepared \
 #   --sam2-cfg sam2_hiera_t.yaml \
 #   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_tiny.pt \
-#   --finetuned /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/distill_maskcls_t/best_full_finetune.pt \
-#   --num-vis 100 --stratified-vis \
-#   --bg-mask-mode mix --bg-mix-p 0.5 \
-#   --out-dir /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/vis_finetuned_tiny
-
-# python /home/wcheng31/sam2_classify/test_sam2_infer.py \
-#   --eval-set prepared \
-#   --sam2-cfg sam2_hiera_t.yaml \
-#   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_tiny.pt \
-#   --finetuned /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/best_full_finetune.pt \
+#   --finetuned-ckpt /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/distill_maskcls_t/best_full_finetune.pt \
 #   --num-vis 100 --stratified-vis \
 #   --bg-mask-mode mix --bg-mix-p 0.5 \
 #   --out-dir /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/vis_finetuned_tiny

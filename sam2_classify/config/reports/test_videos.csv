@@ -1,0 +1,7 @@
+video_id,task,rows,images,clips,classes_present
+case_002_video_part_002_segment_2,case_002_video_part_002_segment_2,11828,9429,97,"background,clipper,grasper,hook,scissors"
+case_015_video_part_001_segment_2,case_015_video_part_001_segment_2,12621,9077,112,"background,clipper,grasper,hook"
+cholec80_03,cholec80_03,13531,10308,245,"background,clipper,grasper,hook,scissors"
+cholec80_05,cholec80_05,9687,7392,152,"background,clipper,grasper,hook,scissors"
+comprehensive_004_left,comprehensive_004_left,3668,2459,38,"background,grasper,hook"
+heichole_003,heichole_003,11274,8967,262,"background,clipper,grasper,hook,scissors"

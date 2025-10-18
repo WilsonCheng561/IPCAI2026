@@ -1,486 +1,689 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-SAM2 点提示分割 + 分类评测（最小增量版，带 Hydra 初始化）
-- 掩码：用你当前可用的 backup 构建器 build_sam2_video_predictor
-- 特征：并行构建 SAM2 image_encoder，做 masked GAP 得到向量
-- 分类：加载你训练好的 head（best_head.pt），打印 overall/per-class acc
-- 可视化：左原图 / 右遮罩+点+TopK
 
-Author: WZC + ChatGPT (2025-09)
-"""
-
-import os, json, argparse, tempfile, shutil
+import os, sys, json, argparse, math, time, hashlib
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-import pandas as pd
+from torch.utils.data import Dataset, DataLoader
 
+# ---- tqdm ----
 try:
     from tqdm import tqdm
-except Exception:
+except ImportError:
     def tqdm(x, **k): return x
 
-# ----------------- 常量路径（与你原来的保持一致） -----------------
-SMALLFILE_ROOT = Path("/home/wcheng31/sam2_classify/config")
-PRETRAIN_ROOT  = Path("/projects/surgical-video-digital-twin/pretrain_params")
-CKPT_ROOT      = PRETRAIN_ROOT / "cwz" / "sam2_classifier"
+# ---- plotting ----
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except Exception:
+    HAS_MPL = False
 
-# ----------------- Hydra 初始化：关键修复 -----------------
+# ====== hydra / sam2 build ======
+if "/home/wcheng31/sam2" not in sys.path:
+    sys.path.append("/home/wcheng31/sam2")
 from hydra.core.global_hydra import GlobalHydra
 from hydra import initialize
 
-def setup_hydra_configs():
+def _setup_hydra_configs():
     if GlobalHydra.instance().is_initialized():
         GlobalHydra.instance().clear()
-    # 和你之前能工作的脚本保持一致：configs/sam2 在项目根目录下
     initialize(config_path="configs/sam2", version_base="1.2")
 
+try:
+    from sam2.backup.build_sam import build_sam2
+except Exception:
+    from sam2.build_sam import build_sam2
 
-# ----------------- SAM2 构建（使用 backup 构建器） -----------------
-from sam2.backup.build_sam import build_sam2, build_sam2_video_predictor
+# ====== constants / paths ======
+SMALLFILE_ROOT = Path("/home/wcheng31/sam2_classify/config")
 
-# =========================================================
-# 数据集
-# =========================================================
-def pd_read_csv_fast(p: Path):
-    return pd.read_csv(p)
-
-def load_label_map(p: Path) -> Dict:
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
-
+# =============== Dataset ===============
 class FramePointDataset(Dataset):
-    def __init__(self, manifest_csv: Path, label_map_json: Path):
-        self.df = pd_read_csv_fast(manifest_csv)
-        self.lm = load_label_map(label_map_json)
-        self.tool2id = {str(k): int(v) for k, v in self.lm["tool_to_id"].items()}
+    """
+    兼容三类清单：
+    - combined/cholect: 有 'tool' 列和 'points_json'
+    - ood5: 有 'mapped_class' 或 'class_id'，同样有 'points_json'
+    """
+    def __init__(self, manifest_csv: Path, label_map_json: Path, resize: Optional[int] = None):
+        super().__init__()
+        self.df = pd.read_csv(manifest_csv)
+        with open(label_map_json, "r", encoding="utf-8") as f:
+            self.label_map = json.load(f)
+        self.tool2id = self.label_map["tool_to_id"]
+        self.resize = resize
 
-        def has_points(s: str) -> bool:
+        # 统一出 "tool" 列（优先已有的 tool；否则用 mapped_class；否则 class_id->name）
+        if "tool" not in self.df.columns:
+            if "mapped_class" in self.df.columns:
+                self.df["tool"] = self.df["mapped_class"].astype(str)
+            elif "class_id" in self.df.columns:
+                inv = {int(v): k for k, v in self.tool2id.items()}
+                self.df["tool"] = [inv.get(int(cid), "background") for cid in self.df["class_id"].tolist()]
+            else:
+                raise RuntimeError("manifest 缺少 tool / mapped_class / class_id 任一字段")
+        # 过滤掉没有 points_json 或为空的
+        def _has_pos_points(s: str) -> bool:
             try:
                 arr = json.loads(s) if isinstance(s, str) and s.strip() else []
                 return len(arr) > 0
             except Exception:
                 return False
-        self.df = self.df[self.df["points_json"].apply(has_points)].reset_index(drop=True)
+        if "points_json" in self.df.columns:
+            self.df = self.df[self.df["points_json"].apply(_has_pos_points)].reset_index(drop=True)
 
     def __len__(self): return len(self.df)
 
+    def _load_img(self, p: str):
+        img = cv2.imread(p, cv2.IMREAD_COLOR)
+        if img is None:
+            raise FileNotFoundError(p)
+        if self.resize and self.resize > 0:
+            img = cv2.resize(img, (self.resize, self.resize), interpolation=cv2.INTER_AREA)
+        return img
+
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
-        img = cv2.imread(row["image_path"], cv2.IMREAD_COLOR)
-        if img is None:
-            raise FileNotFoundError(row["image_path"])
+        img = self._load_img(row["image_path"])
         H, W = img.shape[:2]
-        pts = json.loads(row["points_json"])
-        pts_out = []
-        for p in pts:
+        pts_raw = json.loads(row["points_json"]) if isinstance(row["points_json"], str) and row["points_json"].strip() else []
+        pts = []
+        for p in pts_raw:
+            if len(p) < 2: continue
             x = float(np.clip(p[0], 0, W-1)); y = float(np.clip(p[1], 0, H-1))
-            lab = 1.0 if float(p[2]) > 0 else 0.0
-            pts_out.append([x, y, lab])
+            label = 1.0 if (len(p) >= 3 and float(p[2]) > 0) else 1.0 # 测试阶段统一当正点
+            pts.append([x, y, label])
+
         tool = str(row["tool"])
-        tool_id = int(self.tool2id[tool])
+        tool_id = self.tool2id.get(tool, None)
+        if tool_id is None:
+            # 退路：严格字符串匹配
+            for k,v in self.tool2id.items():
+                if str(k) == tool: tool_id = v; break
+        if tool_id is None:
+            raise KeyError(f"Tool '{tool}' 不在 label_map 中")
+
         return {
             "image": img,
-            "points": np.asarray(pts_out, np.float32),
-            "tool_id": tool_id,
-            "meta": {"image_path": row["image_path"], "tool": tool}
+            "points": np.asarray(pts, dtype=np.float32) if pts else np.zeros((0,3), np.float32),
+            "target": int(tool_id),
+            "meta": {
+                "image_path": row["image_path"],
+                "tool": tool,
+                "H": H, "W": W,
+            }
         }
 
 def collate_varlen(batch):
-    images  = [b["image"]  for b in batch]
-    points  = [b["points"] for b in batch]
-    targets = torch.tensor([b["tool_id"] for b in batch], dtype=torch.long)
-    metas   = [b["meta"]   for b in batch]
-    return {"images": images, "points": points, "targets": targets, "meta": metas}
+    return {
+        "images":  [b["image"]  for b in batch],
+        "points":  [b["points"] for b in batch],
+        "targets": torch.tensor([b["target"] for b in batch], dtype=torch.long),
+        "meta":    [b["meta"]   for b in batch]
+    }
 
-def choose_split_csv() -> Path:
-    test_csv = SMALLFILE_ROOT / "test_manifest.csv"
-    val_csv  = SMALLFILE_ROOT / "val_manifest.csv"
-    mf_csv   = SMALLFILE_ROOT / "manifest.csv"
-    if test_csv.exists(): return test_csv
-    if val_csv.exists():  return val_csv
-    return mf_csv
-
-# =========================================================
-# 分类头（与训练一致）
-# =========================================================
-class MLPHead(nn.Module):
-    def __init__(self, in_dim: int, n_classes: int, hidden: int = 0, drop: float = 0.0):
+# =============== SAM2 Wrapper (统一推理) ===============
+class Sam2Wrapper(nn.Module):
+    """
+    单张图：
+      - 手动 resize -> 送入 image_encoder
+      - prompt_encoder(points) -> mask_decoder -> mask
+      - mask 加权池化 image_feat -> 向量
+    也支持返回 4D（ViTTokenHead 用）
+    """
+    def __init__(self, cfg: str, ckpt: str, device: str = "cuda", max_edge: Optional[int] = None):
         super().__init__()
-        if hidden and hidden > 0:
+        self.device = device
+        self.max_edge = max_edge
+        _setup_hydra_configs()
+        # 允许直接传文件名（相对 sam2/configs/sam2）
+        cfg = os.path.basename(cfg) if cfg.endswith(".yaml") else cfg
+        self.model = build_sam2(cfg, ckpt, device=device)
+        self._norm_cached = None
+
+    # ---- norm ----
+    def _get_norm(self):
+        if self._norm_cached is not None: return self._norm_cached
+        for obj in [self.model, getattr(self.model, "image_encoder", None)]:
+            pm = getattr(obj, "pixel_mean", None); ps = getattr(obj, "pixel_std", None)
+            if pm is not None and ps is not None:
+                pm = torch.as_tensor(pm, dtype=torch.float32).view(1,3,1,1)
+                ps = torch.as_tensor(ps, dtype=torch.float32).view(1,3,1,1)
+                if pm.max() > 1.5 or ps.max() > 1.5: pm = pm/255.0; ps = ps/255.0
+                self._norm_cached = (pm.to(self.device), ps.to(self.device)); return self._norm_cached
+        pm = torch.tensor([0.485,0.456,0.406], device=self.device).view(1,3,1,1)
+        ps = torch.tensor([0.229,0.224,0.225], device=self.device).view(1,3,1,1)
+        self._norm_cached = (pm, ps); return self._norm_cached
+
+    def _prep(self, img_bgr: np.ndarray):
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        H0, W0 = img_rgb.shape[:2]
+        if self.max_edge is not None and max(H0, W0) > self.max_edge:
+            s = self.max_edge / max(H0, W0)
+            H1 = int(round(H0 * s)); W1 = int(round(W0 * s))
+            img_rgb = cv2.resize(img_rgb, (W1, H1), interpolation=cv2.INTER_AREA)
+        else:
+            H1, W1 = H0, W0
+        t = torch.from_numpy(img_rgb).permute(2,0,1).float().unsqueeze(0)/255.0
+        pm, ps = self._get_norm()
+        t = (t.to(self.device) - pm) / ps
+        return t, (H0, W0), (H1, W1), (H1/H0, W1/W0)
+
+    def _encode_prompts(self, coords: torch.Tensor, labels: torch.Tensor):
+        pe = getattr(self.model, "prompt_encoder", None) or getattr(self.model, "sam_prompt_encoder", None)
+        out = pe(points=(coords, labels), boxes=None, masks=None)
+        if isinstance(out, (list, tuple)):
+            return out[0], out[1]
+        if isinstance(out, dict):
+            return out.get("sparse_prompt_embeddings"), out.get("dense_prompt_embeddings")
+        raise RuntimeError("unexpected prompt encoder output")
+
+    def _decode_mask(self, image_feat, image_pe, sparse_pe, dense_pe, high_res):
+        md = getattr(self.model, "mask_decoder", None) or getattr(self.model, "sam_mask_decoder", None)
+        kwargs = dict(image_embeddings=image_feat, image_pe=image_pe,
+                      sparse_prompt_embeddings=sparse_pe, dense_prompt_embeddings=dense_pe,
+                      multimask_output=False, repeat_image=True)
+        if high_res is not None:
+            kwargs["high_res_features"] = high_res
+        out = md(**kwargs)
+        if isinstance(out, (list, tuple)): return out[0]
+        if isinstance(out, dict): return out.get("masks", out.get("mask_logits"))
+        return out
+
+    def _get_image_embed(self, img_t: torch.Tensor):
+        out = self.model.image_encoder(img_t)
+        if isinstance(out, dict) and ("vision_features" in out):
+            vfeats = out["vision_features"]
+            vpos   = out.get("vision_pos_enc", None)
+            levels = out.get("backbone_fpn", None)
+            if isinstance(vfeats, torch.Tensor): vfeats = [vfeats]
+            cand = [t for t in vfeats if torch.is_tensor(t) and t.ndim==4]
+            img_feat = max(cand, key=lambda t: int(t.shape[-2])*int(t.shape[-1]))
+            Hf,Wf = img_feat.shape[-2:]
+            img_pe=None
+            if isinstance(vpos, (list,tuple)):
+                for p in vpos:
+                    if torch.is_tensor(p) and p.ndim>=3 and int(p.shape[-2])==Hf and int(p.shape[-1])==Wf:
+                        img_pe = p; break
+            elif torch.is_tensor(vpos) and int(vpos.shape[-2])==Hf and int(vpos.shape[-1])==Wf:
+                img_pe = vpos
+            if isinstance(levels,(list,tuple)):
+                levels = [x.to(img_feat.device) for x in levels if torch.is_tensor(x)]
+            elif torch.is_tensor(levels):
+                levels = [levels.to(img_feat.device)]
+            else:
+                levels = []
+            if len(levels)>=2:
+                levels_sorted = sorted(levels, key=lambda t:int(t.shape[-2])*int(t.shape[-1]), reverse=True)
+                high_res = (levels_sorted[0], levels_sorted[1])
+            elif len(levels)==1:
+                high_res = (levels[0], levels[0])
+            else:
+                high_res = None
+            return img_feat, (img_pe.to(img_feat.device) if isinstance(img_pe, torch.Tensor) else None), high_res
+        # fallback
+        tensors=[]
+        def collect(o):
+            if torch.is_tensor(o): tensors.append(o)
+            elif isinstance(o, dict):
+                for v in o.values(): collect(v)
+            elif isinstance(o,(list,tuple)):
+                for v in o: collect(v)
+        collect(out)
+        cand = [t for t in tensors if t.ndim==4]
+        img_feat = max(cand, key=lambda t: int(t.shape[-2])*int(t.shape[-1]))
+        return img_feat, None, None
+
+    @staticmethod
+    def _points_to_coords(pts: np.ndarray, sy: float, sx: float):
+        if pts is None or len(pts)==0:
+            return torch.zeros((1,0,2), dtype=torch.float32)
+        arr = np.asarray(pts, dtype=np.float32).copy()
+        arr[:,0] *= sx; arr[:,1] *= sy
+        return torch.from_numpy(arr[:,:2]).unsqueeze(0).float()
+
+    @torch.no_grad()
+    def forward(self, images_bgr: List[np.ndarray], points_list: List[np.ndarray],
+                metas: Optional[List[dict]]=None, return_4d: bool=False):
+        feats_triplets = []
+        for img_bgr, pts in zip(images_bgr, points_list):
+            img_t, (H0,W0), (H1,W1), (sy,sx) = self._prep(img_bgr)
+            img_feat, img_pe, high_res = self._get_image_embed(img_t)
+            if (pts is None) or (len(pts)==0):
+                mask = torch.ones((1,1,img_feat.shape[-2], img_feat.shape[-1]), device=img_feat.device)
+            else:
+                coords = self._points_to_coords(pts, sy, sx).to(img_feat.device)
+                labels = torch.ones((1, coords.shape[1]), dtype=torch.long, device=img_feat.device)
+                sp, dp = self._encode_prompts(coords, labels)
+                mask_logits = self._decode_mask(img_feat, img_pe, sp, dp, high_res)
+                if mask_logits.shape[-2:] != img_feat.shape[-2:]:
+                    mask_logits = F.interpolate(mask_logits, size=img_feat.shape[-2:], mode="bilinear", align_corners=False)
+                mask = torch.sigmoid(mask_logits)
+            feats_triplets.append((img_feat, mask, img_pe))
+        if return_4d:
+            # 对齐到最小空间尺寸
+            sizes = [t[0].shape[-2:] for t in feats_triplets]
+            th = min(h for h,_ in sizes); tw = min(w for _,w in sizes)
+            def pool_to(x, size): 
+                if x is None: return None
+                return x if x.shape[-2:]==size else F.adaptive_avg_pool2d(x, size)
+            img_b = torch.cat([pool_to(f, (th,tw)) for (f,_,_) in feats_triplets], dim=0)
+            msk_b = torch.cat([pool_to(m, (th,tw)) for (_,m,_) in feats_triplets], dim=0)
+            pe_b  = []
+            for (_,_,pe) in feats_triplets:
+                pe_b.append(torch.zeros_like(img_b[:1]) if pe is None else pool_to(pe, (th,tw)))
+            pe_b = torch.cat(pe_b, dim=0)
+            return img_b, msk_b, pe_b
+        # pool -> vector
+        vecs=[]
+        for (f, m, _) in feats_triplets:
+            v = (f*m).flatten(2).sum(dim=-1)/(m.flatten(2).sum(dim=-1)+1e-6)
+            vecs.append(v.squeeze(0))
+        return torch.stack(vecs, dim=0)
+
+# =============== Heads ===============
+class MLPHead(nn.Module):
+    def __init__(self, in_dim:int, n_classes:int, hidden:int=0, drop:float=0.0):
+        super().__init__()
+        if hidden and hidden>0:
             self.fc1 = nn.Linear(in_dim, hidden)
             self.act = nn.ReLU(inplace=True)
-            self.drop = nn.Dropout(drop) if drop and drop > 0 else nn.Identity()
+            self.drop = nn.Dropout(drop) if drop>0 else nn.Identity()
             self.fc2 = nn.Linear(hidden, n_classes)
-            self._deep = True
+            self._deep=True
         else:
             self.fc = nn.Linear(in_dim, n_classes)
-            self._deep = False
-    def forward(self, x):
+            self._deep=False
+    def forward(self,x):
         if not self._deep: return self.fc(x)
         return self.fc2(self.drop(self.act(self.fc1(x))))
 
-class MLPBNHead(nn.Module):
-    def __init__(self, in_dim: int, n_classes: int, hidden_layers: List[int], drop: float = 0.0):
-        super().__init__()
-        dims = [in_dim] + list(hidden_layers)
-        layers = []
-        for i in range(len(dims)-1):
-            layers += [nn.Linear(dims[i], dims[i+1]), nn.BatchNorm1d(dims[i+1]), nn.GELU()]
-            if drop and drop > 0: layers.append(nn.Dropout(drop))
-        self.mlp = nn.Sequential(*layers)
-        self.out = nn.Linear(dims[-1], n_classes)
-    def forward(self, x): return self.out(self.mlp(x))
-
 class CosineClassifier(nn.Module):
-    def __init__(self, in_dim: int, n_classes: int, scale: float = 16.0):
+    def __init__(self, in_dim:int, n_classes:int, scale:float=16.0):
         super().__init__()
         self.weight = nn.Parameter(torch.randn(n_classes, in_dim))
         nn.init.xavier_normal_(self.weight)
         self.scale = float(scale)
-    def forward(self, x):
-        x_n = F.normalize(x, dim=1)
-        w_n = F.normalize(self.weight, dim=1)
+    def forward(self,x):
+        x_n = F.normalize(x, dim=1); w_n = F.normalize(self.weight, dim=1)
         return self.scale * F.linear(x_n, w_n)
 
-def _parse_hidden_list(s: str) -> List[int]:
-    out = []
-    for p in str(s).split(","):
-        p = p.strip()
-        if p: out.append(int(p))
-    return out
-
-def build_head_from_args(in_dim, n_classes, args_dict, override: Optional[str] = None):
-    head_type = override or args_dict.get("head", "mlp")
-    drop  = float(args_dict.get("drop", 0.0))
-    scale = float(args_dict.get("scale", 16.0))
-    hidden = args_dict.get("hidden", "0")
-    if head_type == "linear":
-        return MLPHead(in_dim, n_classes, hidden=0, drop=drop)
-    if head_type == "mlp":
-        h = _parse_hidden_list(hidden)[0] if isinstance(hidden, str) else (hidden[0] if hidden else 0)
-        return MLPHead(in_dim, n_classes, hidden=h, drop=drop)
-    if head_type == "mlp_bn":
-        hs = _parse_hidden_list(hidden) or [1024, 512]
-        return MLPBNHead(in_dim, n_classes, hidden_layers=hs, drop=drop)
-    if head_type == "cosine":
-        return CosineClassifier(in_dim, n_classes, scale=scale)
-    return MLPHead(in_dim, n_classes, hidden=0, drop=drop)
-
-# =========================================================
-# SAM2 编码器（取最高分辨率 4D 特征）
-# =========================================================
-class Sam2ImageEncoder(nn.Module):
-    def __init__(self, cfg: str, ckpt: str, device: str = "cuda"):
+class ViTTokenHead(nn.Module):
+    def __init__(self, in_dim:int, n_classes:int,
+                 num_layers:int=2, num_heads:int=4,
+                 mlp_ratio:float=4.0, p_drop:float=0.05,
+                 max_tokens:int=1024, min_keep_tokens:int=256):
         super().__init__()
-        self.device = device
-        self.model = build_sam2(cfg, ckpt, device=device)
-        self.model.eval()
-        for p in self.model.parameters(): p.requires_grad_(False)
-        pm = getattr(self.model.image_encoder, "pixel_mean", [123.675, 116.28, 103.53])
-        ps = getattr(self.model.image_encoder, "pixel_std",  [58.395, 57.12, 57.375])
-        pm = torch.as_tensor(pm, dtype=torch.float32).view(1,3,1,1) / 255.0
-        ps = torch.as_tensor(ps, dtype=torch.float32).view(1,3,1,1) / 255.0
-        self.register_buffer("pixel_mean", pm)
-        self.register_buffer("pixel_std",  ps)
+        self.max_tokens=int(max_tokens); self.min_keep_tokens=int(min_keep_tokens)
+        self.cls = nn.Parameter(torch.zeros(1,1,in_dim))
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=in_dim, nhead=num_heads,
+            dim_feedforward=int(mlp_ratio*in_dim), dropout=p_drop,
+            activation="gelu", batch_first=True, norm_first=True
+        )
+        self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(in_dim)
+        self.fc   = nn.Linear(in_dim, n_classes)
+        nn.init.trunc_normal_(self.cls, std=0.02)
 
-    def _legal_hw_from_orig(self, H0: int, W0: int):
-        enc = getattr(self.model, "image_encoder", None)
-        trunk = getattr(enc, "trunk", None)
-        # 取 patch_embed 的卷积参数
-        conv = trunk.patch_embed.proj
-        k_h, k_w = conv.kernel_size if isinstance(conv.kernel_size, tuple) else (conv.kernel_size, conv.kernel_size)
-        s_h, s_w = conv.stride      if isinstance(conv.stride, tuple)      else (conv.stride, conv.stride)
-        p_h, p_w = conv.padding     if isinstance(conv.padding, tuple)     else (conv.padding, conv.padding)
+    def _pos(self, B,C,H,W, device):
+        y = torch.arange(H, device=device).float(); x = torch.arange(W, device=device).float()
+        yy,xx = torch.meshgrid(y,x, indexing="ij"); yy/=max(1.0,H); xx/=max(1.0,W)
+        freqs=[1.0,2.0,4.0,8.0]
+        pe=[torch.sin(2*math.pi*f*yy) for f in freqs]+[torch.cos(2*math.pi*f*yy) for f in freqs] + \
+           [torch.sin(2*math.pi*f*xx) for f in freqs]+[torch.cos(2*math.pi*f*xx) for f in freqs]
+        pe=torch.stack(pe, dim=-1)
+        if pe.shape[-1]<C: pe=torch.cat([pe, torch.zeros(H,W,C-pe.shape[-1], device=device)], dim=-1)
+        elif pe.shape[-1]>C: pe=pe[...,:C]
+        return pe.permute(2,0,1).unsqueeze(0).expand(B,-1,-1,-1).contiguous()
 
-        # 取 window_size（没有就用 16）
-        win = getattr(trunk, "window_size", 16)
-        if isinstance(win, (list, tuple)):
-            win = int(win[0])
+    def forward(self, img_feat:torch.Tensor, mask:Optional[torch.Tensor]=None, pos:Optional[torch.Tensor]=None):
+        B,C,H,W = img_feat.shape
+        N = H*W
+        if N>self.max_tokens:
+            s=math.sqrt(N/float(self.max_tokens))
+            Ht=max(1,int(H/s+0.5)); Wt=max(1,int(W/s+0.5))
+            while Ht*Wt>self.max_tokens:
+                if Ht>=Wt and Ht>1: Ht-=1
+                elif Wt>1: Wt-=1
+                else: break
+            img_feat = F.adaptive_avg_pool2d(img_feat, (Ht,Wt))
+            if pos  is not None: pos  = F.adaptive_avg_pool2d(pos, (Ht,Wt))
+            if mask is not None: mask = F.adaptive_max_pool2d(mask,(Ht,Wt))
+            H,W = Ht,Wt
+        if pos is None:
+            pos = self._pos(B,C,H,W,img_feat.device)
+        x = (img_feat+pos).permute(0,2,3,1).reshape(B,H*W,C)
+        key_padding=None
+        if mask is not None:
+            thr=0.3
+            keep=(mask>thr).flatten(1)
+            Kmin=min(self.min_keep_tokens, H*W)
+            for i in range(B):
+                if int(keep[i].sum())<Kmin:
+                    vals=mask[i,0].flatten()
+                    k=min(Kmin, vals.numel())
+                    topk=torch.topk(vals,k=k,dim=0).indices
+                    keep[i].zero_(); keep[i,topk]=True
+            key_padding=(~keep).bool()
+        cls=self.cls.expand(B,-1,-1)
+        x=torch.cat([cls,x], dim=1)
+        if key_padding is not None:
+            pad0=torch.zeros(B,1, dtype=torch.bool, device=x.device)
+            key_padding=torch.cat([pad0, key_padding], dim=1)
+        x=self.enc(x, src_key_padding_mask=key_padding)
+        cls_out=self.norm(x[:,0])
+        return self.fc(cls_out)
 
-        def tokens(n, k, s, p): return int((n + 2 * p - k) // s + 1)
-        def size(n_tok, k, s, p): return int(s * (n_tok - 1) + k - 2 * p)
-
-        # 原图对应的 token 数
-        t_h0 = max(1, tokens(H0, k_h, s_h, p_h))
-        t_w0 = max(1, tokens(W0, k_w, s_w, p_w))
-
-        # **关键：向上取整到 window_size 的整数倍**
-        import math
-        t_h = max(win, int(math.ceil(t_h0 / win)) * win)
-        t_w = max(win, int(math.ceil(t_w0 / win)) * win)
-
-        # 反算得到“合法”的输入像素尺寸
-        H_in = size(t_h, k_h, s_h, p_h)
-        W_in = size(t_w, k_w, s_w, p_w)
-
-        sy = H_in / max(1.0, float(H0))
-        sx = W_in / max(1.0, float(W0))
-        return H_in, W_in, sy, sx
-
-
-    @torch.no_grad()
-    def encode(self, img_bgr: np.ndarray) -> torch.Tensor:
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        H0, W0 = img_rgb.shape[:2]
-
-        # 计算“合法输入尺寸”，并按该尺寸 resize（避免 176/180 这种不对齐）
-        H_in, W_in, sy, sx = self._legal_hw_from_orig(H0, W0)
-        if (H_in, W_in) != (H0, W0):
-            img_rgb = cv2.resize(img_rgb, (W_in, H_in), interpolation=cv2.INTER_AREA)
-
-        # to tensor + 归一化（确保 mean/std 跟随到相同设备）
-        x = torch.from_numpy(img_rgb).permute(2, 0, 1).float().unsqueeze(0) / 255.0
-        x = x.to(self.device, non_blocking=True)
-        pm = self.pixel_mean.to(x.device)
-        ps = self.pixel_std.to(x.device)
-        x = (x - pm) / ps
-
-
-        out = self.model.image_encoder(x)
-        feats = []
-        def collect(o):
-            if torch.is_tensor(o) and o.ndim==4: feats.append(o)
-            elif isinstance(o, dict):
-                for v in o.values(): collect(v)
-            elif isinstance(o, (list,tuple)):
-                for v in o: collect(v)
-        collect(out)
-        if not feats:
-            raise RuntimeError("image_encoder returned no 4D features")
-        feat = max(feats, key=lambda t: int(t.shape[-2])*int(t.shape[-1]))
-        return feat  # (1,C,Hf,Wf)
-
-# =========================================================
-# 掩码、特征、分类
-# =========================================================
+# =============== metrics / viz ===============
 @torch.no_grad()
-def predictor_mask_from_points(predictor, img_bgr: np.ndarray, pts_np: np.ndarray, mask_thr: float = 0.5) -> np.ndarray:
-    H, W = img_bgr.shape[:2]
-    tmpdir = tempfile.mkdtemp(prefix="sam2_one_")
+def _compute_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, n_classes: int):
+    conf = torch.zeros((n_classes, n_classes), dtype=torch.long, device=y_true.device)
+    for t,p in zip(y_true, y_pred): conf[t,p]+=1
+    eps=1e-12
+    tp=conf.diag().float(); pp=conf.sum(0).float(); tpfn=conf.sum(1).float()
+    prec = tp/(pp+eps); rec = tp/(tpfn+eps)
+    f1 = 2*prec*rec/(prec+rec+eps)
+    return {
+        "acc": (y_true==y_pred).float().mean().item(),
+        "macro_f1": torch.nanmean(f1).item(),
+        "balanced_acc": torch.nanmean(rec).item(),
+        "confusion": conf.cpu()
+    }
+
+def _save_confmat(cm: np.ndarray, id2name: Dict[int,str], path: Path, title: str):
+    if not HAS_MPL:
+        print("[WARN] matplotlib 不可用，跳过保存混淆矩阵")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        row = cm.sum(1, keepdims=True); cmn = np.divide(cm, row, out=np.zeros_like(cm, float), where=row>0)
+    fig, ax = plt.subplots(figsize=(7,6), dpi=160)
+    im=ax.imshow(cmn, interpolation="nearest", aspect="auto")
+    ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    classes=[id2name.get(i,str(i)) for i in range(cm.shape[0])]
+    ax.set(xticks=np.arange(cm.shape[1]), yticks=np.arange(cm.shape[0]),
+           xticklabels=classes, yticklabels=classes, xlabel="Pred", ylabel="GT", title=title)
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j,i, str(int(cm[i,j])), ha="center", va="center", fontsize=7)
+    fig.tight_layout(); fig.savefig(str(path), bbox_inches="tight"); plt.close(fig)
+
+# =============== ckpt loader / model builder ===============
+def _build_and_load(args, tool2id: Dict[str,int], device: str):
+    """
+    返回 (extractor, head, head_type)
+    自动识别 5 种：
+      - 冻结 + 线性/MLP/Cosine（仅 head_state）
+      - E2E ViTTokenHead（best_e2e.pt）
+      - Finetune + (Cosine/MLP/Linear) 蒸馏（best_full_finetune.pt）
+    """
+    ckpt = torch.load(args.ckpt, map_location="cpu")
+    has_sam2 = ("sam2_state" in ckpt) or any(k.startswith("model.") for k in ckpt.keys())
+    has_head = ("head_state" in ckpt) or any(k.startswith("fc") or k.startswith("mlp") or k.startswith("weight") for k in ckpt.keys())
+
+    # 构建 extractor
+    extractor = Sam2Wrapper(args.sam2_cfg, args.sam2_ckpt, device=device, max_edge=args.max_input_edge).to(device)
+    extractor.eval()
+
+    # 自动推断 head 类型
+    saved_args = ckpt.get("args", {})
+    head_hint = saved_args.get("head", None)
+    n_classes = ckpt.get("n_classes", len(tool2id))
+    id2name = {int(v):k for k,v in tool2id.items()}
+
+    def _mk_head_linear(in_dim): return MLPHead(in_dim, n_classes, hidden=0).to(device)
+    def _mk_head_mlp(in_dim, hidden=0): return MLPHead(in_dim, n_classes, hidden=hidden or saved_args.get("hidden",0), drop=saved_args.get("drop",0.0)).to(device)
+    def _mk_head_cos(in_dim): return CosineClassifier(in_dim, n_classes, scale=float(saved_args.get("scale",16.0))).to(device)
+    def _mk_head_vit(in_dim):
+        return ViTTokenHead(
+            in_dim, n_classes,
+            num_layers=int(saved_args.get("vit_layers",2)),
+            num_heads=int(saved_args.get("vit_heads",4)),
+            mlp_ratio=float(saved_args.get("vit_mlp_ratio",4.0)),
+            p_drop=float(saved_args.get("vit_drop",0.05)),
+            max_tokens=int(saved_args.get("vit_max_tokens",1024)),
+            min_keep_tokens=int(saved_args.get("vit_min_keep",256)),
+        ).to(device)
+
+    # 探测 in_dim（两种路径：向量 or 4D）
+    dummy_img = np.zeros((256,256,3), np.uint8)
+    dummy_pts = np.array([[128,128,1.0]], np.float32)
+    with torch.no_grad():
+        # 尝试 4D
+        img4, m4, p4 = extractor([dummy_img],[dummy_pts],[{}], return_4d=True)
+        in_dim_4d = int(img4.shape[1])
+        vec = (img4*m4).flatten(2).mean(-1)  # 类似池化
+        in_dim = int(vec.shape[-1])
+        # 同时保留 4D head 的 in_dim
+        in_dim_vit = in_dim_4d
+
+    # ===== 路径 A：E2E ViT（best_e2e.pt）=====
+    if has_sam2 and has_head and (head_hint=="vit" or "vit" in str(args.ckpt) or "vit" in str(head_hint or "").lower()):
+        head = _mk_head_vit(in_dim_vit)
+        # SAM2 权重
+        st = ckpt.get("sam2_state", ckpt)
+        try:
+            extractor.model.load_state_dict(st, strict=False)
+        except Exception:
+            pass
+        # head 权重
+        head.load_state_dict(ckpt["head_state"], strict=False)
+        return extractor, head, "vit", id2name
+
+    # ===== 路径 B：Finetune + 非 ViT（best_full_finetune.pt）=====
+    if has_sam2 and has_head:
+        # 按保存时 head 类型还原
+        if head_hint == "cosine":
+            head=_mk_head_cos(in_dim)
+        elif head_hint == "mlp":
+            head=_mk_head_mlp(in_dim, hidden=ckpt.get("args",{}).get("hidden",0))
+        else:
+            head=_mk_head_linear(in_dim)
+        # load
+        st = ckpt.get("sam2_state", ckpt)
+        try:
+            extractor.load_state_dict(st, strict=False)
+        except Exception:
+            extractor.model.load_state_dict(st, strict=False)
+        head.load_state_dict(ckpt["head_state"], strict=False)
+        return extractor, head, (head_hint or "finetune"), id2name
+
+    # ===== 路径 C：冻结骨干（仅 head_state）=====
+    # 需要用户/ckpt 提示 head 类型；尽量推断
+    force_head = (args.force_head or (head_hint if isinstance(head_hint,str) else None))
+    force_head = (force_head or "").lower()
+
+    if force_head == "cosine" or ("weight" in ckpt and isinstance(ckpt["weight"], torch.Tensor)):
+        head = _mk_head_cos(in_dim)
+        state = ckpt.get("head_state", ckpt)
+        head.load_state_dict(state, strict=False)
+        return extractor, head, "cosine", id2name
+
+    if force_head == "mlp":
+        head = _mk_head_mlp(in_dim, hidden=ckpt.get("args",{}).get("hidden",0))
+        state = ckpt.get("head_state", ckpt)
+        head.load_state_dict(state, strict=False)
+        return extractor, head, "mlp", id2name
+
+    if force_head == "linear":
+        head = _mk_head_linear(in_dim)
+        state = ckpt.get("head_state", ckpt)
+        head.load_state_dict(state, strict=False)
+        return extractor, head, "linear", id2name
+
+    # 猜测：优先 cosine -> mlp -> linear
     try:
-        fpath = os.path.join(tmpdir, "0000000.jpg")
-        cv2.imwrite(fpath, img_bgr)
-        state = predictor.init_state(video_path=tmpdir); predictor.reset_state(state)
-        if pts_np.size > 0:
-            xy = pts_np[:, :2].astype(np.float32)
-            lab = (pts_np[:, 2] > 0).astype(np.int64)
-            if lab.sum() == 0: lab[0] = 1
-            oid = 1
-            if hasattr(predictor, "add_new_points"):
-                predictor.add_new_points(state, 0, oid, xy, lab)
-            else:
-                predictor.add_new_points_or_box(state, 0, oid, xy, lab)
-        raw = None
-        for _, obj_ids, logits in predictor.propagate_in_video(state):
-            for i, oid in enumerate(obj_ids):
-                raw = (torch.sigmoid(logits[i]) > mask_thr).float().cpu().numpy()
-        if raw is None:
-            return np.zeros((H,W), np.uint8)
-        m = raw[0] if raw.ndim==3 else raw
-        if m.shape != (H,W):
-            m = cv2.resize(m.astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
-        return (m > 0.5).astype(np.uint8)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        head = _mk_head_cos(in_dim); head.load_state_dict(ckpt.get("head_state", ckpt), strict=False)
+        return extractor, head, "cosine", id2name
+    except Exception:
+        try:
+            head = _mk_head_mlp(in_dim); head.load_state_dict(ckpt.get("head_state", ckpt), strict=False)
+            return extractor, head, "mlp", id2name
+        except Exception:
+            head = _mk_head_linear(in_dim); head.load_state_dict(ckpt.get("head_state", ckpt), strict=False)
+            return extractor, head, "linear", id2name
 
-@torch.no_grad()
-def masked_gap_feature(feat_4d: torch.Tensor, mask_hw: np.ndarray) -> torch.Tensor:
-    _, C, Hf, Wf = feat_4d.shape
-    m = mask_hw.astype(np.float32)
-    if m.shape != (Hf, Wf):
-        m = cv2.resize(m, (Wf, Hf), interpolation=cv2.INTER_LINEAR)
-    m_t = torch.from_numpy(m).to(feat_4d.device).view(1,1,Hf,Wf)
-    num = (feat_4d * m_t).flatten(2).sum(-1)
-    den = m_t.flatten(2).sum(-1).clamp_min(1e-6)
-    return num / den  # (1,C)
-
-# =========================================================
-# 评测 & 可视化
-# =========================================================
-@torch.no_grad()
-def evaluate_and_visualize(ds: Dataset,
-                           predictor,
-                           encoder: Sam2ImageEncoder,
-                           head: nn.Module,
-                           id2name: Dict[int,str],
-                           out_dir: Path,
-                           num_vis: int = 50,
-                           mask_thr: float = 0.5,
-                           topk: int = 3,
-                           device: str = "cuda"):
+# =============== evaluate ===============
+@torch.inference_mode()
+def evaluate(extractor: nn.Module, head: nn.Module, loader: DataLoader, device: str,
+             head_type: str, id2name: Dict[int,str], out_dir: Path,
+             save_logits: bool = True):
+    extractor.eval(); head.eval()
+    y_true=[]; y_pred=[]; all_logits=[]
+    pbar=tqdm(loader, total=len(loader), ncols=100, desc="Eval")
+    for batch in pbar:
+        imgs, pts, metas = batch["images"], batch["points"], batch["meta"]
+        y = batch["targets"].to(device)
+        if head_type=="vit":
+            img4, m4, p4 = extractor(imgs, pts, metas, return_4d=True)
+            logits = head(img4, m4, p4)
+        else:
+            vecs = extractor(imgs, pts, metas, return_4d=False)
+            logits = head(vecs)
+        pred = logits.argmax(1)
+        y_true.extend(y.tolist()); y_pred.extend(pred.tolist())
+        if save_logits:
+            all_logits.append(logits.detach().cpu())
+    y_true = torch.tensor(y_true); y_pred=torch.tensor(y_pred)
+    metrics = _compute_metrics(y_true, y_pred, n_classes=len(id2name))
+    # save
     out_dir.mkdir(parents=True, exist_ok=True)
-    n_classes = len(id2name)
-    total = 0; correct = 0
-    per_total = [0]*n_classes; per_corr = [0]*n_classes
+    # confusion png + per-class csv
+    cm = metrics["confusion"].numpy()
+    _save_confmat(cm, id2name, out_dir/"confusion.png",
+                  title=f"acc={metrics['acc']:.3f} macroF1={metrics['macro_f1']:.3f} balAcc={metrics['balanced_acc']:.3f}")
+    rows=[]
+    per_cls_total=cm.sum(1); per_cls_correct=np.diag(cm)
+    for c in range(cm.shape[0]):
+        n=int(per_cls_total[c]); acc_c=(per_cls_correct[c]/n) if n>0 else float("nan")
+        rows.append({
+            "class_id": c,
+            "class_name": id2name.get(c,str(c)),
+            "support": n,
+            "acc": float(acc_c)
+        })
+    pd.DataFrame(rows).to_csv(out_dir/"per_class.csv", index=False)
+    with open(out_dir/"metrics.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "acc": metrics["acc"],
+            "macro_f1": metrics["macro_f1"],
+            "balanced_acc": metrics["balanced_acc"],
+            "n": int(len(y_true)),
+            "head_type": head_type
+        })+"\n")
+    if save_logits and len(all_logits)>0:
+        np.savez_compressed(out_dir/"logits.npz", logits=torch.cat(all_logits,0).numpy(), y=y_true.numpy(), y_pred=y_pred.numpy())
+    # console
+    print(f"[RESULT] acc={metrics['acc']:.4f}  macroF1={metrics['macro_f1']:.4f}  balAcc={metrics['balanced_acc']:.4f}")
+    # also a text log
+    with open(out_dir/"eval_log.txt","a",encoding="utf-8") as f:
+        f.write(f"acc={metrics['acc']:.6f} macroF1={metrics['macro_f1']:.6f} balAcc={metrics['balanced_acc']:.6f}\n")
 
-    # 可视化索引：按 image_path 去重并采样
-    if hasattr(ds, "df") and "image_path" in ds.df.columns:
-        dfv = ds.df.drop_duplicates(subset=["image_path"]).sample(frac=1.0, random_state=42)
-        vis_idx = dfv.index.tolist()[:num_vis]
-    else:
-        vis_idx = list(range(min(num_vis, len(ds))))
-
-    pbar = tqdm(range(len(ds)), ncols=100, desc="[eval]")
-    vis_written = 0
-    for i in pbar:
-        sample = ds[i]
-        img = sample["image"]; pts = sample["points"]; gt = int(sample["tool_id"])
-
-        # 掩码
-        mask = predictor_mask_from_points(predictor, img, pts, mask_thr=mask_thr)
-
-        # 特征 & 分类
-        feat4 = encoder.encode(img)
-        vec   = masked_gap_feature(feat4, mask)  # (1,C)
-        logits = head(vec.to(device))
-        pred   = int(logits.argmax(dim=1).item())
-
-        # 统计
-        total += 1; correct += int(pred == gt)
-        per_total[gt] += 1; per_corr[gt] += int(pred == gt)
-        pbar.set_postfix(acc=f"{correct/max(1,total):.3f}")
-
-        # 可视化
-        if vis_written < num_vis and i in vis_idx:
-            prob = torch.softmax(logits, dim=1)[0].detach().cpu().numpy()
-            top = prob.argsort()[::-1][:topk]
-            right = img.copy()
-            right[mask.astype(bool)] = 0
-            for (x,y,lab) in pts:
-                c = (0,255,0) if lab>0 else (0,0,255)
-                cv2.circle(right, (int(round(x)), int(round(y))), 5, c, -1, cv2.LINE_AA)
-                cv2.circle(right, (int(round(x)), int(round(y))), 6, (0,0,0), 1, cv2.LINE_AA)
-            y0 = 28
-            cv2.putText(right, f"GT: {id2name.get(gt,str(gt))} (p={prob[gt]:.3f})",
-                        (8,y0), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2, cv2.LINE_AA)
-            y = y0 + 28
-            for r,k in enumerate(top,1):
-                cv2.putText(right, f"Top{r}: {id2name.get(int(k),str(k))} {prob[k]:.3f}",
-                            (8,y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
-                y += 24
-            canvas = np.concatenate([img, right], axis=1)
-            cv2.imwrite(str(out_dir / f"vis_{vis_written:04d}.jpg"), canvas)
-            vis_written += 1
-
-    # 打印指标
-    overall = correct / max(1,total)
-    print(f"\n=== Overall ===\nAcc: {overall:.4f}  (#samples={total})")
-    print("\n=== Per-class Acc ===")
-    for c in range(n_classes):
-        n = per_total[c]
-        acc_c = per_corr[c] / max(1,n)
-        print(f"{c:2d} {id2name.get(c,str(c)):>18s}: acc={acc_c:.4f}  (n={n})")
-
-# =========================================================
-# Main
-# =========================================================
+# =============== main ===============
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--eval-set", choices=["prepared"], default="prepared")
-    ap.add_argument("--sam2-cfg",  type=str, default=str(PRETRAIN_ROOT / "sam2_hiera_l.yaml"))
-    ap.add_argument("--sam2-ckpt", type=str, default=str(PRETRAIN_ROOT / "sam2_hiera_large.pt"))
-    ap.add_argument("--ckpt", type=str, required=True, help="head ckpt (best_head.pt)")
-    ap.add_argument("--num-vis", type=int, default=50)
-    ap.add_argument("--mask-thr", type=float, default=0.5)
-    ap.add_argument("--topk", type=int, default=3)
-    ap.add_argument("--out-dir", type=str, default=str(CKPT_ROOT / "vis_test"))
+    ap = argparse.ArgumentParser("Unified SAM2 classifier test (5 models, 3 datasets)")
+    # 固定为相对路径
+    ap.add_argument("--sam2-cfg",  type=str, default="sam2_hiera_l.yaml")
+    ap.add_argument("--sam2-ckpt", type=str, default="pretrain_params/sam2_hiera_large.pt")
+    # 只用一个参数切数据集
+    ap.add_argument("--dataset", choices=["combined","cholect","ood5"], default="combined")
+    # 可选：手动覆盖
+    ap.add_argument("--manifest",  type=str, default=None)
+    ap.add_argument("--label-map", type=str, default=None)
+    # ckpt & 输出
+    ap.add_argument("--ckpt", type=str, required=True, help="head-only / best_e2e.pt / best_full_finetune.pt")
+    ap.add_argument("--out-root", type=str, default="eval_runs")
+    # 其他
+    ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--max-input-edge", type=int, default=None, help="限制长边，可留空")
+    ap.add_argument("--force-head", choices=["linear","mlp","cosine","vit"], default=None, help="万一自动识别失败可强制指定")
+    ap.add_argument("--save-logits", action="store_true")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.backends.cudnn.benchmark = True
 
-    # 数据
-    label_map_path = SMALLFILE_ROOT / "label_map.json"
+    # 数据集映射
+    if args.manifest is None or args.label_map is None:
+        if args.dataset == "combined":
+            manifest_path = SMALLFILE_ROOT / "val_manifest_10.csv"
+            label_map_path = SMALLFILE_ROOT / "label_map.json"
+        elif args.dataset == "cholect":
+            manifest_path = SMALLFILE_ROOT / "cholect" / "val_manifest_10.csv"
+            label_map_path = SMALLFILE_ROOT / "cholect" / "label_map.json"
+        else:  # ood5
+            # 这里默认你把 5 类 OOD 的脚本输出到了这个目录
+            base = Path("/home/wcheng31/sam2_classify/ood5")
+            manifest_path = base / "manifest.csv"
+            label_map_path = base / "label_map.json"
+    else:
+        manifest_path = Path(args.manifest); label_map_path = Path(args.label_map)
+
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"manifest 不存在: {manifest_path}")
     if not label_map_path.exists():
-        raise FileNotFoundError(f"missing label_map: {label_map_path}")
-    label_map = load_label_map(label_map_path)
-    tool2id = {str(k): int(v) for k,v in label_map["tool_to_id"].items()}
-    id2name = {int(v): str(k) for k,v in tool2id.items()}
+        raise FileNotFoundError(f"label_map 不存在: {label_map_path}")
 
-    csv_path = choose_split_csv()
-    if not csv_path.exists():
-        raise FileNotFoundError(csv_path)
-    ds = FramePointDataset(csv_path, label_map_path)
+    # 读取 label_map / dataloader
+    with open(label_map_path,"r",encoding="utf-8") as f:
+        lm = json.load(f)
+    tool2id = lm["tool_to_id"]
+    id2name = {int(v):k for k,v in tool2id.items()}
 
-    # 关键：先初始化 Hydra，再 build predictor
-    setup_hydra_configs()
-    predictor = build_sam2_video_predictor(args.sam2_cfg, args.sam2_ckpt, device=device)
-    print("SAM-2 predictor ready.")
+    ds = FramePointDataset(manifest_path, label_map_path, resize=None)
+    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers,
+                    pin_memory=True, collate_fn=collate_varlen)
 
-    # 编码器 & 头
-    encoder = Sam2ImageEncoder(args.sam2_cfg, args.sam2_ckpt, device=device)
+    # 构建 & 加载
+    extractor, head, head_type, id2name_from_ckpt = _build_and_load(args, tool2id, device)
+    # 以当前数据集的 id2name 为准（避免跨集 label-map 不同）
+    head_type = (args.force_head or head_type)
 
-    ckpt = torch.load(args.ckpt, map_location="cpu")
-    ck_args = ckpt.get("args", {})
-    in_dim  = int(ckpt.get("in_dim", 0))
-    n_cls   = int(ckpt.get("n_classes", len(tool2id)))
-    if n_cls != len(tool2id):
-        print(f"[WARN] n_classes mismatch: ckpt={n_cls}, current={len(tool2id)} (use current).")
-        n_cls = len(tool2id)
-    head = build_head_from_args(in_dim, n_cls, ck_args).to(device)
-    state = ckpt.get("head_state", ckpt)
-    head.load_state_dict(state, strict=False)
-    head.eval()
+    # 输出目录（无时间戳）
+    run_name = Path(args.ckpt).stem
+    out_dir = Path(args.out_root) / args.dataset / run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    evaluate_and_visualize(ds, predictor, encoder, head, id2name,
-                           out_dir=out_dir, num_vis=args.num_vis,
-                           mask_thr=args.mask_thr, topk=args.topk, device=device)
+    # 评估
+    evaluate(extractor, head, dl, device, head_type, id2name, out_dir, save_logits=args.save_logits)
 
 if __name__ == "__main__":
     main()
 
-
-
-# 只训练classifier
-
+# 1) 冻结骨干 + 线性头（Frozen + Linear）
 # python /home/wcheng31/sam2_classify/test_sam2_classify.py \
-#   --eval-set prepared \
-#   --sam2-cfg sam2_hiera_l.yaml \
-#   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_large.pt \
-#   --ckpt /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/best_head.pt \
-#   --num-vis 50 --mask-thr 0.5 --topk 3 \
-#   --out-dir /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/vis_test
+#   --ckpt ckpts/frozen_linear_head.pt \
+#   --dataset combined
 
-
+# 2) 冻结骨干 + MLP 头（Frozen + MLP）
 # python /home/wcheng31/sam2_classify/test_sam2_classify.py \
-#   --eval-set prepared \
-#   --resume-mode head \
-#   --ckpt /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/best_head.pt \
-#   --sam2-cfg sam2_hiera_l.yaml \
-#   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_large.pt \
-#   --batch-size 128 \
-#   --bg-mask-mode mix --bg-mix-p 0.5 \
-#   --apply-ckpt-logit-adjust \
-#   --stratified-vis \
-#   --num-vis 50
+#   --ckpt ckpts/frozen_mlp_head.pt \
+#   --dataset combined
 
-# 只可视化点
+# 3) 冻结骨干 + Cosine 头（Frozen + Cosine）
 # python /home/wcheng31/sam2_classify/test_sam2_classify.py \
-#   --eval-set prepared \
-#   --resume-mode head \
-#   --ckpt /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/best_head.pt \
-#   --sam2-cfg sam2_hiera_l.yaml \
-#   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_large.pt \
-#   --num-vis 50 \
-#   --vis-points-only
+#   --ckpt ckpts/frozen_cosine_head.pt \
+#   --dataset combined
 
-# finetune 整个 sam2
+
+# 4) 端到端 + ViTTokenHead（Finetune + ViT）
 # python /home/wcheng31/sam2_classify/test_sam2_classify.py \
-#   --eval-set prepared \
-#   --resume-mode full \
-#   --ckpt /projects/surgical-video-digital-twin/pretrain_params/cwz/sam2_classifier/best_full_finetune.pt \
-#   --sam2-cfg sam2_hiera_l.yaml \
-#   --sam2-ckpt /projects/surgical-video-digital-twin/pretrain_params/sam2_hiera_large.pt \
-#   --batch-size 128 \
-#   --bg-mask-mode mix --bg-mix-p 0.5 \
-#   --apply-ckpt-logit-adjust \
-#   --stratified-vis \
-#   --num-vis 50
+#   --ckpt sam2_classifier/vit_head_e2e/best_e2e.pt \
+#   --dataset cholect
+
+# 5) 全量微调 + 蒸馏（Finetune + Distill，非 ViT 头）
+# python /home/wcheng31/sam2_classify/test_sam2_classify.py \
+#   --ckpt sam2_classifier/distill_maskcls_t/best_full_finetune.pt \
+#   --dataset ood5

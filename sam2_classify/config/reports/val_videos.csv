@@ -1,0 +1,7 @@
+video_id,task,rows,images,clips,classes_present
+case_010_video_part_002_segment_2,case_010_video_part_002_segment_2,13771,10349,118,"background,clipper,grasper,hook"
+case_018_video_part_002_segment_3,case_018_video_part_002_segment_3,7865,5875,59,"background,clipper,grasper,hook"
+cholec80_02,cholec80_02,10296,7404,170,"background,clipper,grasper,hook,scissors"
+comprehensive_007_left,comprehensive_007_left,10566,8228,105,"background,grasper,hook"
+heichole_010,heichole_010,6115,4579,140,"background,clipper,grasper,hook,scissors"
+youtube_cholecystectomy_chenyan_00003,youtube_cholecystectomy_chenyan_00003,3273,2605,56,"background,clipper,grasper,hook,scissors"
